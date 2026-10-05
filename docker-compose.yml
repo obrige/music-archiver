@@ -1,0 +1,13 @@
+services:
+  music-archiver:
+    build: .
+    container_name: music-archiver
+    ports:
+      - "5245:5245"
+    environment:
+      - PORT=5245
+      - DATA_DIR=/data
+      - CONCURRENCY=3
+    volumes:
+      - ./data:/data
+    restart: unless-stopped

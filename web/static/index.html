@@ -1,0 +1,135 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>MusicArchiver</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <div class="app">
+    <header>
+      <div class="logo"><span class="icon">♪</span>MusicArchiver</div>
+      <nav>
+        <button id="tab-search" class="on">搜索</button>
+        <button id="tab-tasks">任务</button>
+        <button id="tab-library">曲库</button>
+        <button id="tab-settings">设置</button>
+      </nav>
+    </header>
+
+    <!-- 搜索 -->
+    <section id="view-search" class="view">
+      <div class="card">
+        <div class="row">
+          <select id="platform" style="max-width:140px"></select>
+          <input id="query" list="tip-list" placeholder="输入歌名 / 歌手，回车搜索…" />
+          <datalist id="tip-list"></datalist>
+          <button id="btn-search" class="primary">搜索</button>
+        </div>
+        <div class="row" id="hot-row" style="display:none">
+          <span class="hint" style="white-space:nowrap">🔥 热搜</span>
+          <div id="hot-box" style="display:flex;flex-wrap:wrap;gap:6px"></div>
+        </div>
+        <div class="row">
+          <label style="display:flex;align-items:center;gap:6px"><input type="checkbox" id="with-lyric" checked /> 歌词(.lrc)</label>
+          <label style="display:flex;align-items:center;gap:6px"><input type="checkbox" id="with-cover" checked /> 封面(.jpg)</label>
+          <span style="flex:1"></span>
+          <button id="btn-batch">批量上传所选(0)</button>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th style="width:36px"><input type="checkbox" id="check-all" /></th>
+                <th>歌名</th><th>歌手</th><th>专辑</th><th>音质</th><th>时长</th><th style="width:170px">操作</th>
+              </tr>
+            </thead>
+            <tbody id="search-tbody"></tbody>
+          </table>
+          <div id="search-empty" class="empty" style="display:none">
+            <div class="em">🎵</div>
+            <div>搜索你喜欢的音乐，然后试听 / 下载 / 上传到 WebDAV</div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- 任务 -->
+    <section id="view-tasks" class="view" style="display:none">
+      <div class="card">
+        <div class="row">
+          <button id="btn-sse" class="primary">开启实时进度</button>
+          <span id="sse-state" class="hint">未连接</span>
+        </div>
+        <div id="task-list"></div>
+        <div id="task-empty" class="empty" style="display:none">
+          <div class="em">📋</div>
+          <div>暂无任务</div>
+        </div>
+      </div>
+    </section>
+
+    <!-- 曲库 -->
+    <section id="view-library" class="view" style="display:none">
+      <div class="card">
+        <div class="row">
+          <button id="btn-refresh-lib" class="primary">刷新</button>
+          <button id="btn-backfill" class="primary">补全缺失(音质/歌词/封面)</button>
+          <span class="hint">浏览 WebDAV 中的归档文件</span>
+        </div>
+        <div class="row" id="lib-nav"></div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>路径</th><th>类型</th><th>大小</th><th style="width:90px">操作</th></tr></thead>
+            <tbody id="lib-tbody"></tbody>
+          </table>
+          <div id="lib-empty" class="empty" style="display:none">
+            <div class="em">🗂️</div>
+            <div>曲库为空，先去搜索页上传几首歌吧</div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- 设置 -->
+    <section id="view-settings" class="view" style="display:none">
+      <div class="section-title">WebDAV 配置</div>
+      <div class="card">
+        <div class="row"><input id="dav-url" placeholder="http://host.docker.internal:5244/dav" /></div>
+        <div class="row"><input id="dav-user" placeholder="用户名" /><input id="dav-pass" type="password" placeholder="密码(留空则不修改)" /></div>
+        <div class="row">
+          <button id="btn-save-cfg" class="primary">保存</button>
+          <span class="hint">配置保存在本地数据目录，重启不丢失</span>
+        </div>
+      </div>
+
+      <div class="section-title">音源管理（洛雪音源脚本）</div>
+      <div class="card">
+        <div class="row"><input id="import-url" placeholder="https://… 洛雪音源脚本地址" /><button id="btn-import-url" class="primary">URL 导入</button></div>
+        <div class="row"><input type="file" id="import-file" accept=".js" style="flex:1" /><span class="hint">本地 .js 导入</span></div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>名称</th><th>平台</th><th>音质</th><th>最近成功</th><th style="width:90px">操作</th></tr></thead>
+            <tbody id="source-tbody"></tbody>
+          </table>
+          <div id="source-empty" class="empty" style="display:none">
+            <div class="em">🧩</div>
+            <div>还没有音源，导入一个洛雪音源脚本（URL 或本地 .js）</div>
+          </div>
+        </div>
+      </div>
+    </section>
+  </div>
+
+  <div id="player" class="player" style="display:none">
+    <span id="player-info"></span>
+    <audio id="audio" controls autoplay></audio>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
