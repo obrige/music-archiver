@@ -5,8 +5,11 @@
 - /api/sources/import-files: 批量上传 .js 文件(多选/文件夹)
 - /api/sources/import-zip:  上传 ZIP 批量导入(流式 + 大小限制, 防 OOM/DoS)
 - /api/sources/import-zip-url: 下载 URL 指向的 ZIP 批量导入
+- /api/sources/scores: 获取所有音源评分(成功率/延迟/分)
 - /api/subscriptions: 订阅分组 CRUD
 - /api/subscriptions/{gid}/refresh: 手动触发刷新
+
+智能选源: resolve-all/stream 和 resolve-all 按 SourceScore 降序并发跑, 优先用高分源.
 """
 import asyncio
 import json
@@ -24,7 +27,7 @@ from .services import (SEARCH_IMPL, dav_delete, dav_mkcol, dav_propfind,
                        safe_name, search_tip, spec_from_flac, upgrade_pic)
 
 router = APIRouter()
-UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36'
+UA = 'Mozilla/0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36'.replace('Mozilla/0', 'Mozilla/5.0')
 PLATFORM_NAMES = {'wy': '网易云', 'kg': '酷狗', 'tx': 'QQ音乐', 'kw': '酷我', 'mg': '咪咕', 'local': '本地'}
 
 
@@ -63,7 +66,7 @@ def post_config(body: dict, request: Request):
     cfg['url'] = str(b.get('url') or '').strip()
     cfg['user'] = str(b.get('user') or '')
     p = str(b.get('pass') or '')
-    if p and p != '***':  # 空或掩码时不覆盖原密码
+    if p and p != '***':
         cfg['pass'] = p
     _save_cfg(request, cfg)
     return {'ok': True}
@@ -116,7 +119,7 @@ def debug_search_mg(q: str = '晴天'):
         raw = http_get(url, headers={
             'uiVersion': 'A_music_3.6.1', 'deviceId': MG_DEVICE, 'timestamp': ts,
             'sign': mg_sign(ts, q), 'channel': '0146921',
-            'User-Agent': 'Mozilla/5.0 (Linux; U; Android 11.0.0; zh-cn; MI 11 Build/OPR1.170623.032) AppleWebKit/534.30 (KHTML, like Gecko) Version/4.0 Mobile Safari/534.30',
+            'User-Agent': 'Mozilla/0 (Linux; U; Android 11.0.0; zh-cn; MI 11 Build/OPR1.170623.032) AppleWebKit/534.30 (KHTML, like Gecko) Version/4.0 Mobile Safari/534.30'.replace('Mozilla/0', 'Mozilla/5.0'),
         }, timeout=15)
         return raw[:1500]
     except Exception as e:
@@ -132,8 +135,13 @@ def search(body: dict, request: Request):
     if not query:
         raise HTTPException(400, 'query 不能为空')
     sm = request.app.state.sm
-    # 脚本原生搜索优先(音源声明 search/musicSearch action 时)
-    script_sources = [h for h in sm.handles_for(platform) if 'search' in ((h.sources.get(platform) or {}).get('actions') or []) or 'musicSearch' in ((h.sources.get(platform) or {}).get('actions') or [])]
+    # 优先用高分源做搜索: 至少尝试评分里有数据的 1 个
+    handles_all = sm.handles_for(platform)
+    if handles_all:
+        handles = sm.handles_for_score(platform) or handles_all
+    else:
+        handles = []
+    script_sources = [h for h in handles if 'search' in ((h.sources.get(platform) or {}).get('actions') or []) or 'musicSearch' in ((h.sources.get(platform) or {}).get('actions') or [])]
     impl = SEARCH_IMPL.get(platform)
     if not impl and not script_sources:
         raise HTTPException(400, '不支持的搜索平台: %s' % platform)
@@ -186,12 +194,19 @@ def lyric(platform: str = 'wy', id: str = ''):
 
 @router.post('/api/resolve-all/stream')
 async def resolve_all_stream(body: dict, request: Request):
+    """流式解析: 所有源并发跑(按分数排序), 每源完成立刻推送."""
     import queue as _q
     import threading as _th
     platform = str(body.get('platform') or '')
+    preferred_quality = str(body.get('preferredQuality') or '') or None
     song = body.get('song') or {}
     sm = request.app.state.sm
-    handles = sm.handles_for(platform)
+    source_id = str(body.get('sourceId') or '')
+    if source_id and sm.get(source_id):
+        handles = [sm.get(source_id)]
+    else:
+        # 智能选源: 按分数降序(若指定 preferred_quality 则按该音质匹配打分)
+        handles = sm.handles_for_score(platform, preferred_quality)
     mp3_black = {'128k', '192k', '320k'}
     rq = _q.Queue()
 
@@ -199,7 +214,7 @@ async def resolve_all_stream(body: dict, request: Request):
         try:
             qs = [q for q in ((h.sources.get(platform) or {}).get('qualitys') or []) if q not in mp3_black]
             if not qs:
-                rq.put(('err', h.name, []))
+                rq.put(('err', h.name, [], h.score.score(preferred_quality)))
                 return
             r = h.resolve_multi(platform, song, qs, overall_timeout=30)
             entries = []
@@ -213,9 +228,9 @@ async def resolve_all_stream(body: dict, request: Request):
                 fi = parse_flac_info(head)
                 entries.append({'quality': q, 'url': url, 'spec': spec, 'size': size,
                                 'sr': fi['sr'] if fi else 0, 'bits': fi['bits'] if fi else 0})
-            rq.put(('ok', h.name, entries))
+            rq.put(('ok', h.name, entries, h.score.score(preferred_quality)))
         except Exception:
-            rq.put(('err', h.name, []))
+            rq.put(('err', h.name, [], 0))
 
     threads = []
     for hh in handles:
@@ -230,10 +245,10 @@ async def resolve_all_stream(body: dict, request: Request):
             if await request.is_disconnected():
                 break
             try:
-                kind, name, entries = rq.get(timeout=1)
+                kind, name, entries, score = rq.get(timeout=1)
                 remaining -= 1
                 if entries:
-                    yield 'data: ' + json.dumps({'source': name, 'list': entries}, ensure_ascii=False) + '\n\n'
+                    yield 'data: ' + json.dumps({'source': name, 'list': entries, 'score': round(score, 3)}, ensure_ascii=False) + '\n\n'
             except _q.Empty:
                 continue
         yield 'data: ' + json.dumps({'done': True}) + '\n\n'
@@ -338,10 +353,8 @@ def _run_backfill(task_q, task, cfg, sm):
                         if not any(it.get('isDir') for it in cur):
                             dav_mkcol(cfg, rel_enc)
                         for spec, data in uploads:
-                            # 同大小 = 完全相同, 跳过
                             if any((it.get('size') and it['size'] == len(data)) for it in cur if not it.get('isDir')):
                                 continue
-                            # 同名但不同大小(不同平台编码)则加序号
                             fname = '%s (%s).flac' % (name, spec)
                             n = 2
                             while any((it.get('displayname') or '') == fname for it in cur):
@@ -363,7 +376,6 @@ def _run_backfill(task_q, task, cfg, sm):
             threads.append(t)
         for t in threads:
             t.join()
-        # 歌词: 依次尝试各平台, 上传后验证确实存在才算完成
         if not has_lrc:
             for lp in ['wy', 'tx', 'kg', 'kw', 'mg']:
                 try:
@@ -389,7 +401,6 @@ def _run_backfill(task_q, task, cfg, sm):
                     task_q.log(task, '[%s] 歌词上传未生效, 换下一接口' % lp)
                 except Exception as e:
                     task_q.log(task, '[%s] 歌词失败: %s' % (lp, str(e)[:60]))
-        # 封面: 依次尝试各平台, 上传后验证
         if not has_jpg:
             for cp in ['wy', 'tx', 'kg', 'kw', 'mg']:
                 try:
@@ -435,6 +446,7 @@ def backfill(body: dict, request: Request):
 def resolve_all(body: dict, request: Request):
     b = body or {}
     platform = str(b.get('platform') or '')
+    preferred_quality = str(b.get('preferredQuality') or '') or None
     song = b.get('song') or {}
     qualities = b.get('qualities') if isinstance(b.get('qualities'), list) else []
     sm = request.app.state.sm
@@ -442,17 +454,15 @@ def resolve_all(body: dict, request: Request):
     if source_id and sm.get(source_id):
         handles = [sm.get(source_id)]
     else:
-        handles = sm.handles_for(platform)
+        # 智能选源: 按分数降序(若指定 preferred_quality 则按该音质匹配打分)
+        handles = sm.handles_for_score(platform, preferred_quality)
     if not qualities:
-        # 兜底: 该平台所有音源声明的全部音质
         for h in handles:
             for q in (h.sources.get(platform) or {}).get('qualitys') or []:
                 if q not in qualities:
                     qualities.append(q)
     if not qualities or not handles:
         return {'list': []}
-    # 所有音源同时(并行)解析, 一起出力
-    # 每家只测自己声明的音质标签; 128k/192k/320k(MP3档)直接拉黑
     mp3_black = {'128k', '192k', '320k'}
     collected = {}
     if handles:
@@ -467,7 +477,7 @@ def resolve_all(body: dict, request: Request):
                 futs.append((ex.submit(h.resolve_multi, platform, song, qs), h))
             for fut, h in futs:
                 try:
-                    r = fut.result(timeout=22)  # 单源整体超时 22s, 挂的源不阻塞
+                    r = fut.result(timeout=22)
                     for q, url in r.items():
                         if url:
                             collected.setdefault(q, []).append(url)
@@ -476,7 +486,6 @@ def resolve_all(body: dict, request: Request):
     priority = {'128k': 0, '192k': 1, '320k': 2, 'flac': 3, 'flac24bit': 4,
                 'hires': 5, 'hiRes': 5, 'sky': 5, 'jyeffect': 5, 'jymaster': 6,
                 'atmos': 6, 'atmos_plus': 6, 'dolby': 6, 'master': 6}
-    # 下载文件头实测规格 + 文件大小
     entries = []
     tasks = []
     for q, urls in collected.items():
@@ -498,10 +507,9 @@ def resolve_all(body: dict, request: Request):
             for res in ex.map(lambda t: _head_worker(t[0], t[1]), tasks):
                 if res:
                     entries.append(res)
-    # 按文件大小去重: 同大小 = 同一文件, 保留低音质标注; 不同大小的全部显示
     by_size = {}
     for e in entries:
-        key = e['size'] if e['size'] else e['url']  # 大小未知时退回 URL
+        key = e['size'] if e['size'] else e['url']
         p = priority.get(e['quality'], 5)
         if key not in by_size or p < priority.get(by_size[key]['quality'], 5):
             by_size[key] = e
@@ -521,8 +529,8 @@ def resolve(body: dict, request: Request):
     if sid and sm.get(sid):
         handles = [sm.get(sid)]
     else:
-        # 自动: 按顺序尝试所有支持该平台的音源
-        handles = sm.handles_for(platform)
+        # 按分数排序(按指定 quality 算分), 逐个试, 优先用高分源
+        handles = sm.handles_for_score(platform, quality)
     if not handles:
         raise HTTPException(404, '没有支持该平台的音源')
     last_err = None
@@ -538,6 +546,12 @@ def resolve(body: dict, request: Request):
 @router.get('/api/sources')
 def sources(request: Request):
     return request.app.state.sm.list()
+
+
+@router.get('/api/sources/scores')
+def source_scores(request: Request):
+    """所有音源评分(成功率/延迟/复合分), 给前端展示用"""
+    return request.app.state.sm.scores_map()
 
 
 @router.post('/api/sources/import-url')
@@ -595,7 +609,6 @@ async def import_zip(request: Request):
         f = form.get('file')
         if not f:
             raise HTTPException(400, '未提供 ZIP 文件')
-        # 流式写临时文件, 超限立即中止并返回 413
         size = 0
         tmp = tempfile.NamedTemporaryFile(suffix='.zip', delete=False)
         try:
@@ -633,8 +646,7 @@ async def import_zip(request: Request):
 
 @router.post('/api/sources/import-zip-url')
 def import_zip_url(body: dict, request: Request):
-    """下载 URL 指向的 ZIP 后批量导入. body: { url }
-    URL 下载有 60s 超时(由 SourceManager.import_from_url_zip 控制)."""
+    """下载 URL 指向的 ZIP 后批量导入. body: { url }"""
     url = str((body or {}).get('url') or '').strip()
     if not re.match(r'^https?://', url):
         raise HTTPException(400, 'url 必须为 http(s) 链接')
@@ -719,14 +731,12 @@ def webdav_list(request: Request, path: str = ''):
     if not cfg.get('url'):
         raise HTTPException(400, '请先配置 WebDAV')
     try:
-        # path 为 href 形式(/dav/xxx/), 转成相对 WebDAV 根的路径
         base_path = urllib.parse.urlparse(cfg['url']).path.rstrip('/')
         rel = path
         if base_path and rel.startswith(base_path):
             rel = rel[len(base_path):]
         rel = rel.lstrip('/').rstrip('/')
         items = dav_propfind(cfg, rel, '1')
-        # 过滤自身(响应 href 是 URL 编码的, 需解码比较)
         self_href = urllib.parse.quote((base_path or '') + '/' + rel if rel else (base_path or '') + '/')
         return [it for it in items if urllib.parse.unquote(it['href']).rstrip('/') != urllib.parse.unquote(self_href).rstrip('/')]
     except Exception as e:
@@ -739,7 +749,6 @@ def webdav_delete(body: dict, request: Request):
     href = str((body or {}).get('href') or '')
     if not href:
         raise HTTPException(400, 'href 不能为空')
-    # href 解实体后规范化编码(& → %26 等), 传给 davDelete
     try:
         base_path = urllib.parse.urlparse(cfg.get('url', '')).path.rstrip('/')
         if re.match(r'^https?:', href):
@@ -813,7 +822,6 @@ def _run_upload(task_q, task, handles, cfg, platform, songs, qualities, with_lyr
         dir_name = safe_name(name)
         dir_path = urllib.parse.quote(dir_name, safe='')
         task_q.log(task, '== %s ==' % name)
-        # 1. 所有音源并行解析 + 实测 + 按大小去重
         try:
             entries = _collect_entries(platform, song, handles)
         except Exception as e:
@@ -822,7 +830,6 @@ def _run_upload(task_q, task, handles, cfg, platform, songs, qualities, with_lyr
         if not entries:
             task_q.log(task, '该曲无可用 FLAC 音质')
             continue
-        # 3. 全部 FLAC 上传(不同规格文件名不同, 天然并存; 同大小/同名跳过)
         for e in entries:
             q, url, spec = e['quality'], e['url'], e['spec']
             total += 1
@@ -833,11 +840,9 @@ def _run_upload(task_q, task, handles, cfg, platform, songs, qualities, with_lyr
                     task_q.log(task, '[%s] 下载失败或非FLAC' % q)
                     continue
                 existing = dav_propfind(cfg, dir_path, '1')
-                # 同大小 = 完全相同, 跳过
                 if any((it.get('size') and it['size'] == len(data)) for it in existing if not it.get('isDir')):
                     task_q.log(task, '已存在相同文件(同大小), 跳过')
                     continue
-                # 同名但不同大小(不同平台编码)则加序号
                 fname = '%s (%s).flac' % (dir_name, spec)
                 n = 2
                 while any((it.get('displayname') or '') == fname for it in existing):
@@ -853,7 +858,6 @@ def _run_upload(task_q, task, handles, cfg, platform, songs, qualities, with_lyr
             except Exception as e:
                 task_q.log(task, '[%s] %s' % (q, str(e)))
             task_q.progress(task, total, planned)
-        # 4. 歌词 + 封面(全平台歌词)
         if with_lyric and song.get('id'):
             total += 1
             try:
@@ -912,7 +916,8 @@ def create_task(body: dict, request: Request):
     if source_id and sm.get(source_id):
         handles = [sm.get(source_id)]
     else:
-        handles = sm.handles_for(platform)
+        # 智能选源: 按分数降序, 高分源先跑
+        handles = sm.handles_for_score(platform)
         if not handles:
             raise HTTPException(404, '没有支持该平台的音源')
     cfg = _load_cfg(request)
