@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import queue
+import re
 import subprocess
 import threading
 import time as _time
@@ -35,8 +36,25 @@ SUB_UPDATE_TIMEOUT = 300
 AUTOUPDATER_PARALLEL = 3
 SCORE_SAVE_INTERVAL = 30
 BATCH_IMPORT_PARALLEL = 4
-# Action precheck: 有些源不声明 actions(老格式), 严格校验只对显式声明的源生效
 STRICT_ACTION_CHECK = True
+
+# 版本号提取: 匹配 V + 6位 YYMMDD, 如 V261017 → 2026-10-17
+# 适用: GitHub release 风格(如 guoyue2010/lxmusic-, V+YYMMDD 命名规律)
+_VERSION_RE = re.compile(r'V(\d{2})(\d{2})(\d{2})')
+
+
+def _extract_version(text):
+    """从 URL/redirect 目标提取 V+YYMMDD 版本. 返回 'YYYY-MM-DD' 或 None."""
+    if not text:
+        return None
+    m = _VERSION_RE.search(text)
+    if not m:
+        return None
+    yy, mm, dd = m.groups()
+    try:
+        return f'20{yy}-{mm}-{dd}'
+    except Exception:
+        return None
 
 
 class SourceScore:
@@ -147,7 +165,6 @@ class SourceScore:
 class LxScriptHandle:
     """Per-source node bridge handle. 每次解析用 _acquire/_release 池化复用进程,
     大幅减少 cold-start 100ms spawn 开销."""
-
     POOL_MAX = 1
     POOL_TTL = 30
     POOL_MAX_AGE = 600
@@ -166,7 +183,6 @@ class LxScriptHandle:
         self._rate_lock = threading.Lock()
         self._rate_last = [0.0]
         self._rate_interval = 0.5
-        # init 健康: 'pending' | 'ok' | 'fail'; fail 时 _init_error 有详情
         self.init_status = 'pending'
         self.init_error = None
         self._pool = []
@@ -283,7 +299,6 @@ class LxScriptHandle:
                 if mtype == 'meta':
                     self.name = msg.get('name') or '未命名音源'
                     raw_sources = msg.get('sources') or {}
-                    # 规整化 sources: actions 缺省时补 ['musicUrl'], 兼容老格式脚本
                     self.sources = {}
                     for plat, info in raw_sources.items():
                         info = dict(info or {})
@@ -335,11 +350,9 @@ class LxScriptHandle:
         return info.get('actions') or []
 
     def _supports_action(self, platform, action):
-        """严格检查: 仅当脚本显式声明 actions 且不含目标 action 时拒绝.
-        老格式脚本(actions 缺失)兼容: 视为全支持."""
         actions = self._actions_for(platform)
         if not actions:
-            return True  # 老格式: 不挡
+            return True
         return action in actions
 
     def resolve(self, source, song, quality):
@@ -433,7 +446,6 @@ class LxScriptHandle:
                             log.debug('script console: %s', msg.get('msg'))
                         continue
                     if msg.get('ok') is False:
-                        # 单个 quality 失败不 break, 跳过继续试下一个
                         log.debug('%s: quality %s 失败: %s', self.name, quality, msg.get('error'))
                         break
                     if msg.get('ok'):
@@ -457,7 +469,6 @@ class LxScriptHandle:
 
     def search(self, platform, keyword, page=1, limit=30):
         actions = self._actions_for(platform)
-        # search 类 action: 老格式脚本用 'search', 新格式用 'musicSearch'; 两者都接受
         if actions and 'musicSearch' not in actions and 'search' not in actions:
             raise RuntimeError(f'{self.name or "音源"} 不支持 {platform} 的搜索 (actions={actions})')
 
@@ -654,7 +665,8 @@ class SourceManager:
             if r.status != 200:
                 raise RuntimeError('下载失败 HTTP %s %s' % (r.status, url))
             text = r.read().decode('utf-8', 'replace')
-        return self.import_script(text)
+            final_url = r.geturl()
+        return self.import_script(text), final_url
 
     # ---- 批量 / 压缩包 ----
     def import_from_files(self, files):
@@ -751,14 +763,16 @@ class SourceManager:
                 pass
 
     def import_from_url_zip(self, url):
+        """下载 URL 指向的 ZIP 后批量导入. 返回 (result, final_url) 以便上层识别重定向后的真实版本."""
         req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
         with urllib.request.urlopen(req, timeout=60) as r:
             if r.status != 200:
                 raise RuntimeError('下载失败 HTTP %s %s' % (r.status, url))
             raw = r.read()
+            final_url = r.geturl()
         if not raw:
             raise RuntimeError('下载内容为空')
-        return self.import_from_zip_bytes(raw)
+        return self.import_from_zip_bytes(raw), final_url
 
     def remove(self, sid):
         h = self.handles.pop(sid, None)
@@ -809,12 +823,14 @@ class SourceManager:
 
 
 class SubscriptionManager:
-    """订阅分组: 一组 URL(.js / .zip 混合), 定时整体刷新."""
+    """订阅分组: 一组 URL(.js / .zip 混合), 定时整体刷新. per-group 锁防并发竞争."""
     def __init__(self, data_dir, source_manager):
         self.data_dir = Path(data_dir)
         self.store_file = self.data_dir / 'subscriptions.json'
         self.sm = source_manager
         self.groups = []
+        # URL -> 解析到的版本字符串 (如 '2026-10-17'), 用于观测和未来跳过未变化版本
+        self.last_versions = {}  # gid -> { url: 'YYYY-MM-DD' }
         self._locks = {}
         self._locks_guard = threading.Lock()
 
@@ -825,6 +841,11 @@ class SubscriptionManager:
             self.groups = json.loads(self.store_file.read_text('utf-8'))
             if not isinstance(self.groups, list):
                 self.groups = []
+            for g in self.groups:
+                gid = g.get('id')
+                lv = g.get('lastVersions')
+                if isinstance(lv, dict) and gid:
+                    self.last_versions[gid] = lv
             log.info('subs: 已恢复 %d 个订阅组', len(self.groups))
         except Exception as e:
             log.warning('subs: 读取 subscriptions.json 失败: %s', e)
@@ -832,6 +853,11 @@ class SubscriptionManager:
 
     def _save(self):
         self.data_dir.mkdir(parents=True, exist_ok=True)
+        # 把内存中的 last_versions 写回每个 group
+        for g in self.groups:
+            gid = g.get('id')
+            if gid and gid in self.last_versions:
+                g['lastVersions'] = self.last_versions[gid]
         tmp = self.store_file.with_suffix('.json.tmp')
         try:
             with open(tmp, 'w', encoding='utf-8') as f:
@@ -873,6 +899,7 @@ class SubscriptionManager:
             'lastUpdate': None,
             'sources': [],
             'lastErrorCount': 0,
+            'lastVersions': {},  # URL -> 'YYYY-MM-DD'
         })
         self._save()
         return gid
@@ -891,6 +918,7 @@ class SubscriptionManager:
             self._save()
         with self._locks_guard:
             self._locks.pop(gid, None)
+        self.last_versions.pop(gid, None)
         return True
 
     def update(self, gid):
@@ -905,21 +933,35 @@ class SubscriptionManager:
                     log.warning('清旧源 %s 失败: %s', sid, ex)
             g['sources'] = []
             new_sids, errors = [], []
+            per_url_ver = {}  # 本轮抓到的 url -> version
             for item in (g.get('urls') or []):
                 url = (item.get('url') if isinstance(item, dict) else item) or ''
                 kind = (item.get('kind') if isinstance(item, dict) else 'js') or 'js'
                 if not url:
                     continue
+                final_url = None
                 try:
                     if kind == 'zip':
-                        res = self.sm.import_from_url_zip(url)
+                        res_tuple = self.sm.import_from_url_zip(url)
+                        if isinstance(res_tuple, tuple) and len(res_tuple) == 2:
+                            res, final_url = res_tuple
+                        else:
+                            res = res_tuple
                         for a in (res.get('added') or []):
                             new_sids.append(a['id'])
                         for f in (res.get('failed') or []):
                             errors.append({'url': url, 'kind': kind, 'error': '[zip] ' + f.get('error', '')})
                     else:
-                        h = self.sm.import_from_url(url)
+                        ret = self.sm.import_from_url(url)
+                        if isinstance(ret, tuple) and len(ret) == 2:
+                            h, final_url = ret
+                        else:
+                            h = ret
                         new_sids.append(h.id)
+                    # 提取版本: 优先用重定向后的 final URL, 否则用原 URL
+                    ver = _extract_version(final_url or url)
+                    if ver:
+                        per_url_ver[url] = ver
                 except Exception as e:
                     errors.append({'url': url, 'kind': kind, 'error': str(e)[:200]})
             if not any(x.get('id') == gid for x in self.groups):
@@ -928,8 +970,12 @@ class SubscriptionManager:
             g['sources'] = new_sids
             g['lastUpdate'] = int(_time.time() * 1000)
             g['lastErrorCount'] = len(errors)
+            if per_url_ver:
+                self.last_versions[gid] = per_url_ver
+                g['lastVersions'] = per_url_ver
             self._save()
-            return {'added': new_sids, 'errors': errors, 'lastUpdate': g['lastUpdate']}
+            return {'added': new_sids, 'errors': errors, 'lastUpdate': g['lastUpdate'],
+                    'versions': per_url_ver}
 
 
 class AutoUpdater:
