@@ -26,7 +26,9 @@ import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+
 log = logging.getLogger('musicarchiver.sources')
+
 
 BRIDGE_TIMEOUT = 35
 META_TIMEOUT = 15
@@ -38,33 +40,45 @@ SCORE_SAVE_INTERVAL = 30
 BATCH_IMPORT_PARALLEL = 4
 STRICT_ACTION_CHECK = True
 
-_VERSION_PATTERNS = [
-    (re.compile(r'[Vv]?(\d{2})(\d{2})(\d{2})'), lambda m: f'20{m.group(1)}-{m.group(2)}-{m.group(3)}'),
-    (re.compile(r'(\d{4})(\d{2})(\d{2})'), lambda m: f'{m.group(1)}-{m.group(2)}-{m.group(3)}' if 2020 <= int(m.group(1)) <= 2099 else None),
-    (re.compile(r'[Vv]?(\d+)\.(\d+)\.(\d+)'), lambda m: f'v{m.group(1)}.{m.group(2)}.{m.group(3)}'),
-]
-
 
 def _extract_version(text):
+    """从 URL/redirect 目标提取版本号. 严格优先级 + 校验:
+    1. YYYYMMDD: '20261017' → '2026-10-17' (8 位连续数字, 年份 2020-2099)
+    2. V+YYMMDD: 'V261017' → '2026-10-17' (V 必需, 月日有效)
+    3. /v6digit/ 路径上下文: '/241225/' → '2024-12-25' (前后定界符, 2020-2099 年)
+    4. Semver: '1.2.3' → 'v1.2.3'
+    注: YYYYMMDD 优先 V+YYMMDD, 避免 '20261017' 被误读成 '2020-26-10'."""
     if not text:
         return None
-    for rx, fmt in _VERSION_PATTERNS:
-        m = rx.search(text)
-        if not m:
-            continue
-        try:
-            v = fmt(m)
-            if v:
-                return v
-        except Exception:
-            continue
+    # 1. YYYYMMDD (8 位连续数字)
+    m = re.search(r'(\d{4})(\d{2})(\d{2})', text)
+    if m:
+        yyyy, mm, dd = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        if 2020 <= yyyy <= 2099 and 1 <= mm <= 12 and 1 <= dd <= 31:
+            return f'{yyyy:04d}-{mm:02d}-{dd:02d}'
+    # 2. V+YYMMDD (V 必需, 6 位数字, 前后非数字边界)
+    m = re.search(r'(?<!\d)[Vv](\d{2})(\d{2})(\d{2})(?!\d)', text)
+    if m:
+        yy, mm, dd = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        if 1 <= mm <= 12 and 1 <= dd <= 31:
+            return f'20{yy:02d}-{mm:02d}-{dd:02d}'
+    # 3. 路径中 6 位日期 (前后定界符 /_-.)
+    m = re.search(r'[/_.-](\d{2})(\d{2})(\d{2})(?=[/_.-])', text)
+    if m:
+        yy, mm, dd = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        if 20 <= yy <= 80 and 1 <= mm <= 12 and 1 <= dd <= 31:
+            return f'20{yy:02d}-{mm:02d}-{dd:02d}'
+    # 4. Semver
+    m = re.search(r'[Vv]?(\d+)\.(\d+)\.(\d+)', text)
+    if m:
+        return f'v{m.group(1)}.{m.group(2)}.{m.group(3)}'
     return None
 
 
 def _extract_url_from_data(raw):
     """从脚本返回的 data 字段提取 URL. 兼容:
     - str: 直接返回(老 LX Music 风格, 如 huibq `return body.url`)
-    - dict: 优先 .url, 兼容 .src / .data
+    - dict: 优先 .url, 兼容 .src / .data / .location; 递归 dict 值(嵌套结构)
     - list: 递归首个
     - 其他: None"""
     if raw is None:
@@ -78,6 +92,10 @@ def _extract_url_from_data(raw):
             v = raw.get(key)
             if isinstance(v, str) and v.startswith(('http://', 'https://')):
                 return v
+            if isinstance(v, dict):
+                u = _extract_url_from_data(v)
+                if u:
+                    return u
         return None
     if isinstance(raw, (list, tuple)) and raw:
         for item in raw:
@@ -94,6 +112,7 @@ class SourceScore:
     BAYES_PRIOR_SUCCESS = 2.5
     LATENCY_FAST_MS = 500
     LATENCY_SLOW_MS = 10000
+    DEFAULT_LATENCY_MS = 5000  # 新源无样本时的默认延迟
     WEIGHT_QUALITY = 0.4
     WEIGHT_SPEED = 0.3
     WEIGHT_RELIABILITY = 0.3
@@ -109,11 +128,18 @@ class SourceScore:
         self.quality_successes = {}
         self.recent_latencies = []
 
-    def record(self, success, latency_ms=None, quality=None, rate_limited=False):
+    def record(self, success=None, latency_ms=None, quality=None, rate_limited=False):
+        """记录一次调用结果.
+        - success: True/False 表示尝试成功/失败
+        - rate_limited: True 表示触发限流(独立统计, 不影响 success/failures)
+        两者都必填其一."""
         if rate_limited:
             self.rate_limited += 1
             self.last_rate_limit_at = _time.time()
+            # rate_limited 的 latency 不计入滑动窗口 (不是真实处理时间)
             return
+        if success is None:
+            return  # success 和 rate_limited 都未给, 静默忽略
         if quality:
             self.quality_attempts[quality] = self.quality_attempts.get(quality, 0) + 1
         if success:
@@ -143,7 +169,7 @@ class SourceScore:
     def avg_latency_ms(self):
         if self.recent_latencies:
             return sum(self.recent_latencies) / len(self.recent_latencies)
-        return (self.LATENCY_FAST_MS + self.LATENCY_SLOW_MS) / 2
+        return self.DEFAULT_LATENCY_MS
 
     def quality_score(self, quality):
         a = self.quality_attempts.get(quality, 0)
@@ -189,9 +215,9 @@ class SourceScore:
         s.last_rate_limit_at = d.get('lastRateLimitAt')
         s.quality_successes = dict(d.get('qualitySuccess') or {})
         s.quality_attempts = dict(d.get('qualityAttempts') or {})
+        # 注: recent_latencies 故意不恢复. 启动后用 default latency 5250 → 5000
+        # 累积 ~20 次后重新 smart select 正常化
         return s
-
-
 class LxScriptHandle:
     """Per-source node bridge handle. 每次解析用 _acquire/_release 池化复用进程,
     大幅减少 cold-start 100ms spawn 开销."""
@@ -417,7 +443,9 @@ class LxScriptHandle:
                 if msg.get('ok'):
                     success = True
                     self.last_success = _time.time()
-                    return msg.get('data')
+                    data = msg.get('data')
+                    url = _extract_url_from_data(data) if data is not None else None
+                    return url
                 raise RuntimeError('音源返回格式无效')
         except queue.Empty:
             if proc is not None:
@@ -555,8 +583,6 @@ class LxScriptHandle:
             for proc, q, _, _ in self._pool:
                 self._kill(proc)
             self._pool = []
-
-
 class SourceManager:
     def __init__(self, data_dir, bridge_path, node='node'):
         self.data_dir = Path(data_dir)
@@ -636,21 +662,20 @@ class SourceManager:
             self.data_dir.mkdir(parents=True, exist_ok=True)
             entries = []
             for sid, h in self.handles.items():
-                raw = h._get_raw() if hasattr(h, '_get_raw') else ''
+                try:
+                    raw = h._get_raw()
+                except Exception:
+                    raw = ''
                 entries.append({
-                    'id': sid,
-                    'name': h.name,
-                    'raw': raw,
-                    'lastSuccess': h.last_success,
-                    'score': h.score.to_dict(),
+                    'id': sid, 'name': h.name, 'raw': raw,
+                    'lastSuccess': h.last_success, 'score': h.score.to_dict(),
                     'initStatus': getattr(h, 'init_status', 'ok'),
                     'initError': getattr(h, 'init_error', None),
                 })
-            content = json.dumps(entries, ensure_ascii=False, indent=2)
             tmp = self.store_file.with_suffix('.json.tmp')
             try:
                 with open(tmp, 'w', encoding='utf-8') as f:
-                    f.write(content)
+                    f.write(json.dumps(entries, ensure_ascii=False, indent=2))
                     f.flush()
                     os.fsync(f.fileno())
                 os.replace(tmp, self.store_file)
@@ -670,21 +695,29 @@ class SourceManager:
         self.handles[sid] = h
         return h
 
-    def _add_batch(self, raws_with_names):
-        if not raws_with_names:
-            return []
+    def _add_batch(self, items):
+        """items: list of (filename, raw_text). 4 worker 并发 _add (含 _load_meta)."""
+        results = [None] * len(items)
 
-        def _do_one(item):
-            fn, raw = item
+        def _worker(idx, fn, raw):
             try:
                 h = self._add(raw)
-                return (fn, h, None)
-            except Exception as e:
-                return (fn, None, str(e)[:120])
+                results[idx] = (fn, h, None)
+            except Exception as ex:
+                results[idx] = (fn, None, str(ex)[:200])
 
-        workers = min(len(raws_with_names), BATCH_IMPORT_PARALLEL)
-        with ThreadPoolExecutor(max_workers=workers) as ex:
-            return list(ex.map(_do_one, raws_with_names))
+        threads = []
+        for i, (fn, raw) in enumerate(items):
+            if i >= BATCH_IMPORT_PARALLEL * 2:
+                for t in threads:
+                    t.join()
+                threads = []
+            t = threading.Thread(target=_worker, args=(i, fn, raw), daemon=True)
+            t.start()
+            threads.append(t)
+        for t in threads:
+            t.join()
+        return results
 
     def import_script(self, raw):
         h = self._add(raw)
@@ -696,11 +729,12 @@ class SourceManager:
         with urllib.request.urlopen(req, timeout=30) as r:
             if r.status != 200:
                 raise RuntimeError('下载失败 HTTP %s %s' % (r.status, url))
-            text = r.read().decode('utf-8', 'replace')
+            raw = r.read().decode('utf-8', 'replace')
             final_url = r.geturl()
-        return self.import_script(text), final_url
+        h = self._add(raw)
+        self._save()
+        return h, final_url
 
-    # ---- 批量 / 压缩包 ----
     def import_from_files(self, files):
         items = []
         for f in files:
@@ -851,8 +885,6 @@ class SourceManager:
                 h.close()
             except Exception:
                 pass
-
-
 class SubscriptionManager:
     """订阅分组: 一组 URL(.js / .zip 混合), 定时整体刷新. per-group 锁防并发竞争."""
     def __init__(self, data_dir, source_manager):
