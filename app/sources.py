@@ -4,13 +4,14 @@
 
 扩展(批次/压缩/订阅):
 - SourceManager.import_from_files: 多个 .js 文件批量导入(前端 multipart)
-- SourceManager.import_from_zip_bytes: ZIP 字节流批量导入
-- SourceManager.import_from_url_zip: URL 下载 ZIP 后批量导入
-- SubscriptionManager: 订阅分组(URL 列表 + 自动刷新间隔)
-- AutoUpdater: 后台线程定期检查订阅组, 间隔到达则刷新
+- SourceManager.import_from_zip_path / _bytes / _url_zip: ZIP 批量导入(支持流式)
+- SubscriptionManager: 订阅分组(URL 列表 + 自动刷新间隔, per-group 锁防并发竞争)
+- AutoUpdater: 后台线程并行刷新到期订阅组
 """
 import io
 import json
+import logging
+import os
 import queue
 import subprocess
 import threading
@@ -20,8 +21,17 @@ import uuid
 import zipfile
 from pathlib import Path
 
+log = logging.getLogger('musicarchiver.sources')
+
 BRIDGE_TIMEOUT = 35
 META_TIMEOUT = 15
+# 订阅间隔上下限(分钟)
+SUB_INTERVAL_MIN = 5
+SUB_INTERVAL_MAX = 10080  # 1 周
+# 订阅刷新单组超时(秒)
+SUB_UPDATE_TIMEOUT = 300
+# AutoUpdater 并行上限
+AUTOUPDATER_PARALLEL = 3
 
 
 class LxScriptHandle:
@@ -60,12 +70,12 @@ class LxScriptHandle:
                 try:
                     msg = json.loads(line)
                 except Exception:
-                    print('[bridge] 忽略非对象消息: ' + str(line)[:200])
+                    log.debug('bridge: 忽略非对象消息: %s', str(line)[:200])
                     continue
                 if isinstance(msg, dict):
                     q.put(msg)
                 else:
-                    print('[bridge] 忽略非对象消息: ' + str(line)[:200])
+                    log.debug('bridge: 忽略非对象消息: %s', str(line)[:200])
         except Exception:
             pass
 
@@ -98,7 +108,7 @@ class LxScriptHandle:
                     self.sources = msg.get('sources') or {}
                     return
                 if mtype == 'console':
-                    print('[script] ' + str(msg.get('msg')))
+                    log.debug('script console: %s', msg.get('msg'))
                     continue
                 if msg.get('ok') is False:
                     raise RuntimeError(msg.get('error') or '音源脚本初始化失败')
@@ -125,7 +135,7 @@ class LxScriptHandle:
                 mtype = msg.get('type')
                 if mtype in ('bridge', 'meta', 'console'):
                     if mtype == 'console':
-                        print('[script] ' + str(msg.get('msg')))
+                        log.debug('script console: %s', msg.get('msg'))
                     continue
                 if msg.get('ok') is False:
                     raise RuntimeError(msg.get('error') or '音源解析失败')
@@ -156,7 +166,7 @@ class LxScriptHandle:
             for quality in qualities:
                 if time.time() > deadline_all:
                     break
-                req = {'source': platform, 'action': 'musicUrl',
+                req = {'platform': platform, 'action': 'musicUrl',
                        'info': {'musicInfo': dict(song), 'type': quality}}
                 proc.stdin.write(json.dumps(req, ensure_ascii=False) + '\n')
                 proc.stdin.flush()
@@ -173,7 +183,7 @@ class LxScriptHandle:
                     mtype = msg.get('type')
                     if mtype in ('bridge', 'meta', 'console'):
                         if mtype == 'console':
-                            print('[script] ' + str(msg.get('msg')))
+                            log.debug('script console: %s', msg.get('msg'))
                         continue
                     if msg.get('ok') is False:
                         break
@@ -226,12 +236,15 @@ class SourceManager:
         self.bridge_path = bridge_path
         self.node = node
         self.handles = {}
+        # _save 互斥锁 + 原子写入(临时文件 + os.replace)防并发损坏
+        self._save_lock = threading.Lock()
 
     def init(self):
         if not self.store_file.exists():
             return
         try:
             entries = json.loads(self.store_file.read_text('utf-8'))
+            recovered = 0
             for e in entries:
                 try:
                     raw = e.get('raw') or ''
@@ -240,11 +253,12 @@ class SourceManager:
                     h.id = e['id']
                     h.last_success = e.get('lastSuccess')
                     self.handles[e['id']] = h
+                    recovered += 1
                 except Exception as ex:
-                    print('[sources] 恢复失败 %s: %s' % (e.get('name'), ex))
-            print('[sources] 已恢复 %d 个音源' % len(self.handles))
-        except Exception:
-            pass
+                    log.warning('恢复音源 %s 失败: %s', e.get('name'), ex)
+            log.info('sources: 已恢复 %d 个音源', recovered)
+        except Exception as e:
+            log.warning('sources: 读取 sources.json 失败: %s', e)
 
     def _write_script(self, sid, raw):
         self.scripts_dir.mkdir(parents=True, exist_ok=True)
@@ -253,15 +267,31 @@ class SourceManager:
         return f
 
     def _save(self):
-        self.data_dir.mkdir(parents=True, exist_ok=True)
-        entries = []
-        for sid, h in self.handles.items():
+        """原子写入: tmp + os.replace, 配合 _save_lock 防并发损坏 sources.json"""
+        with self._save_lock:
+            self.data_dir.mkdir(parents=True, exist_ok=True)
+            entries = []
+            for sid, h in self.handles.items():
+                try:
+                    raw = (self.scripts_dir / (sid + '.js')).read_text('utf-8')
+                except Exception:
+                    raw = ''
+                entries.append({'id': sid, 'name': h.name, 'raw': raw, 'lastSuccess': h.last_success})
+            content = json.dumps(entries, ensure_ascii=False, indent=2)
+            tmp = self.store_file.with_suffix('.json.tmp')
             try:
-                raw = (self.scripts_dir / (sid + '.js')).read_text('utf-8')
+                with open(tmp, 'w', encoding='utf-8') as f:
+                    f.write(content)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp, self.store_file)
             except Exception:
-                raw = ''
-            entries.append({'id': sid, 'name': h.name, 'raw': raw, 'lastSuccess': h.last_success})
-        self.store_file.write_text(json.dumps(entries, ensure_ascii=False, indent=2), 'utf-8')
+                try:
+                    if tmp.exists():
+                        tmp.unlink()
+                except Exception:
+                    pass
+                raise
 
     def _add(self, raw):
         sid = 'lx_' + uuid.uuid4().hex[:10]
@@ -307,8 +337,38 @@ class SourceManager:
             self._save()
         return {'added': added, 'failed': failed}
 
+    def import_from_zip_path(self, zip_path):
+        """从磁盘 ZIP 路径提取所有 .js. 流式上传的主入口(避免 OOM).
+        跳过目录条目 / 隐藏文件 / 非 .js."""
+        added, failed = [], []
+        try:
+            z = zipfile.ZipFile(zip_path)
+        except Exception as e:
+            raise RuntimeError('不是有效的 ZIP 文件: ' + str(e))
+        try:
+            for name in z.namelist():
+                if name.endswith('/'):
+                    continue
+                base = name.split('/')[-1]
+                if base.startswith('.') or not base.lower().endswith('.js'):
+                    continue
+                try:
+                    raw = z.read(name).decode('utf-8', 'replace')
+                    h = self._add(raw)
+                    added.append({'id': h.id, 'name': h.name, 'file': name})
+                except Exception as e:
+                    failed.append({'file': name, 'error': str(e)[:120]})
+        finally:
+            try:
+                z.close()
+            except Exception:
+                pass
+        if added:
+            self._save()
+        return {'added': added, 'failed': failed}
+
     def import_from_zip_bytes(self, raw_bytes):
-        """从 ZIP 字节流提取所有 .js, 逐个导入. 跳过目录/隐藏文件/非 .js"""
+        """从 ZIP 字节流提取所有 .js. 适合小 ZIP; 大 ZIP 走 import_from_zip_path 流式"""
         added, failed = [], []
         try:
             z = zipfile.ZipFile(io.BytesIO(raw_bytes))
@@ -316,7 +376,6 @@ class SourceManager:
             raise RuntimeError('不是有效的 ZIP 文件: ' + str(e))
         try:
             for name in z.namelist():
-                # 跳过目录条目 / 隐藏文件 / 非 .js
                 if name.endswith('/'):
                     continue
                 base = name.split('/')[-1]
@@ -374,12 +433,17 @@ class SourceManager:
 
 
 class SubscriptionManager:
-    """订阅分组: 一组 URL(.js / .zip 混合), 定时整体刷新. 刷新时清理上一次导入的 source, 再重下"""
+    """订阅分组: 一组 URL(.js / .zip 混合), 定时整体刷新.
+    per-group 锁防止 update()/remove()/并发的 AutoUpdater 刷新互踩.
+    刷新时清理上一次导入的 source, 再重下."""
     def __init__(self, data_dir, source_manager):
         self.data_dir = Path(data_dir)
         self.store_file = self.data_dir / 'subscriptions.json'
         self.sm = source_manager
         self.groups = []
+        # per-group 锁, 第一次访问时惰性创建
+        self._locks = {}
+        self._locks_guard = threading.Lock()
 
     def init(self):
         if not self.store_file.exists():
@@ -388,82 +452,124 @@ class SubscriptionManager:
             self.groups = json.loads(self.store_file.read_text('utf-8'))
             if not isinstance(self.groups, list):
                 self.groups = []
-            print('[subs] 已恢复 %d 个订阅组' % len(self.groups))
-        except Exception:
+            log.info('subs: 已恢复 %d 个订阅组', len(self.groups))
+        except Exception as e:
+            log.warning('subs: 读取 subscriptions.json 失败: %s', e)
             self.groups = []
 
     def _save(self):
         self.data_dir.mkdir(parents=True, exist_ok=True)
-        self.store_file.write_text(json.dumps(self.groups, ensure_ascii=False, indent=2), 'utf-8')
+        # 原子写入防半写
+        tmp = self.store_file.with_suffix('.json.tmp')
+        try:
+            with open(tmp, 'w', encoding='utf-8') as f:
+                f.write(json.dumps(self.groups, ensure_ascii=False, indent=2))
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, self.store_file)
+        except Exception:
+            try:
+                if tmp.exists():
+                    tmp.unlink()
+            except Exception:
+                pass
+            raise
+
+    def _lock_for(self, gid):
+        with self._locks_guard:
+            lk = self._locks.get(gid)
+            if lk is None:
+                lk = threading.Lock()
+                self._locks[gid] = lk
+            return lk
 
     def list(self):
         return self.groups
 
     def add(self, name, urls, interval_min=60):
-        gid = 'sub_' + uuid.uuid4().hex[:10]
+        # 间隔下限 5 分钟(防滥用), 上限 1 周(防长时间不更新意外)
+        try:
+            iv = int(interval_min)
+        except Exception:
+            iv = 60
+        iv = max(SUB_INTERVAL_MIN, min(SUB_INTERVAL_MAX, iv))
+        gid = 'sub_' + uuid.uuid4().hex[:12]
         self.groups.append({
             'id': gid,
             'name': name,
             'urls': urls,  # [{url, kind: 'js'|'zip'}]
-            'intervalMin': max(5, int(interval_min)),
+            'intervalMin': iv,
             'lastUpdate': None,
-            'sources': [],  # 该组当前关联的 source id, 刷新时清掉
+            'sources': [],
+            'lastErrorCount': 0,  # 最近一次刷新错误数, 前端显示用
         })
         self._save()
         return gid
 
     def remove(self, gid):
-        # 同时清理该组关联的 source
-        g = next((g for g in self.groups if g['id'] == gid), None)
-        if g is None:
-            return False
-        for sid in (g.get('sources') or []):
-            try:
-                self.sm.remove(sid)
-            except Exception:
-                pass
-        self.groups = [g for g in self.groups if g['id'] != gid]
-        self._save()
+        """持有 per-group 锁, 防止与并发的 update() 互踩产生孤儿 source"""
+        with self._lock_for(gid):
+            g = next((g for g in self.groups if g['id'] == gid), None)
+            if g is None:
+                return False
+            for sid in (g.get('sources') or []):
+                try:
+                    self.sm.remove(sid)
+                except Exception as ex:
+                    log.warning('清理订阅组 %s 旧源 %s 失败: %s', gid, sid, ex)
+            self.groups = [g for g in self.groups if g['id'] != gid]
+            self._save()
+        # 锁已不再需要, 释放引用
+        with self._locks_guard:
+            self._locks.pop(gid, None)
         return True
 
     def update(self, gid):
-        """刷新指定组: 删旧 source, 重下所有 URL, 记录新 ids"""
-        g = next((g for g in self.groups if g['id'] == gid), None)
-        if g is None:
-            raise RuntimeError('订阅组不存在')
-        # 清理旧 source
-        for sid in (g.get('sources') or []):
-            try:
-                self.sm.remove(sid)
-            except Exception:
-                pass
-        new_sids, errors = [], []
-        for item in (g.get('urls') or []):
-            url = (item.get('url') if isinstance(item, dict) else item) or ''
-            kind = (item.get('kind') if isinstance(item, dict) else 'js') or 'js'
-            if not url:
-                continue
-            try:
-                if kind == 'zip':
-                    res = self.sm.import_from_url_zip(url)
-                    for a in (res.get('added') or []):
-                        new_sids.append(a['id'])
-                    for f in (res.get('failed') or []):
-                        errors.append({'url': url, 'kind': kind, 'error': '[zip] ' + f.get('error', '')})
-                else:
-                    h = self.sm.import_from_url(url)
-                    new_sids.append(h.id)
-            except Exception as e:
-                errors.append({'url': url, 'kind': kind, 'error': str(e)[:200]})
-        g['sources'] = new_sids
-        g['lastUpdate'] = int(_time.time() * 1000)
-        self._save()
-        return {'added': new_sids, 'errors': errors, 'lastUpdate': g['lastUpdate']}
+        """持有 per-group 锁, 防止与并发的 update()/remove() 互踩.
+        锁内重新查组, 若已被删除则跳过."""
+        with self._lock_for(gid):
+            g = next((g for g in self.groups if g['id'] == gid), None)
+            if g is None:
+                raise RuntimeError('订阅组不存在')
+            # 清理旧 source
+            for sid in (g.get('sources') or []):
+                try:
+                    self.sm.remove(sid)
+                except Exception as ex:
+                    log.warning('清旧源 %s 失败: %s', sid, ex)
+            g['sources'] = []
+            new_sids, errors = [], []
+            for item in (g.get('urls') or []):
+                url = (item.get('url') if isinstance(item, dict) else item) or ''
+                kind = (item.get('kind') if isinstance(item, dict) else 'js') or 'js'
+                if not url:
+                    continue
+                try:
+                    if kind == 'zip':
+                        res = self.sm.import_from_url_zip(url)
+                        for a in (res.get('added') or []):
+                            new_sids.append(a['id'])
+                        for f in (res.get('failed') or []):
+                            errors.append({'url': url, 'kind': kind, 'error': '[zip] ' + f.get('error', '')})
+                    else:
+                        h = self.sm.import_from_url(url)
+                        new_sids.append(h.id)
+                except Exception as e:
+                    errors.append({'url': url, 'kind': kind, 'error': str(e)[:200]})
+            # 二次检查: 若锁内被其他路径删除, 不再写
+            if not any(x.get('id') == gid for x in self.groups):
+                log.info('订阅组 %s 在更新过程中被删除, 跳过持久化', gid)
+                return {'added': new_sids, 'errors': errors, 'lastUpdate': int(_time.time() * 1000), 'deleted': True}
+            g['sources'] = new_sids
+            g['lastUpdate'] = int(_time.time() * 1000)
+            g['lastErrorCount'] = len(errors)
+            self._save()
+            return {'added': new_sids, 'errors': errors, 'lastUpdate': g['lastUpdate']}
 
 
 class AutoUpdater:
-    """后台守护线程: 每 N 秒扫一遍订阅组, 间隔到达则触发 update.
-    默认 30s 一次扫描, 单组间隔最低 5 分钟(防滥用)."""
+    """后台守护线程: 每 N 秒扫一遍订阅组, 到点的并行触发 update.
+    单组间隔下限 5 分钟(防滥用), 上限 1 周. 并行上限 3 个."""
     def __init__(self, sub_manager, check_interval_sec=30):
         self.sm = sub_manager
         self.check_interval = max(5, int(check_interval_sec))
@@ -476,7 +582,7 @@ class AutoUpdater:
         self._stop.clear()
         self._thread = threading.Thread(target=self._loop, daemon=True, name='auto-updater')
         self._thread.start()
-        print('[auto-updater] 启动, 扫描间隔 %ds' % self.check_interval)
+        log.info('auto-updater: 启动, 扫描间隔 %ds, 并行上限 %d', self.check_interval, AUTOUPDATER_PARALLEL)
 
     def stop(self):
         self._stop.set()
@@ -485,19 +591,32 @@ class AutoUpdater:
         while not self._stop.is_set():
             try:
                 now_ms = int(_time.time() * 1000)
-                for g in list(self.sm.list()):
-                    interval_ms = int(g.get('intervalMin') or 60) * 60 * 1000
-                    last = int(g.get('lastUpdate') or 0)
-                    if now_ms - last >= interval_ms:
-                        try:
-                            self.sm.update(g['id'])
-                            print('[auto-updater] 刷新订阅组: %s (%d 个 source)' % (g.get('name'), len(g.get('sources') or [])))
-                        except Exception as e:
-                            print('[auto-updater] 刷新失败 %s: %s' % (g.get('name'), e))
-            except Exception as e:
-                print('[auto-updater] 循环异常: ' + str(e))
+                due = [
+                    g for g in self.sm.list()
+                    if now_ms - int(g.get('lastUpdate') or 0) >= int(g.get('intervalMin') or 60) * 60 * 1000
+                ]
+                if due:
+                    self._run_due(due)
+            except Exception:
+                log.exception('auto-updater: 循环异常')
             # 可中断 sleep
             for _ in range(self.check_interval):
                 if self._stop.is_set():
                     return
                 _time.sleep(1)
+
+    def _run_due(self, due):
+        """并行刷新多个到期订阅组, 上限 AUTOUPDATER_PARALLEL"""
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        workers = min(len(due), AUTOUPDATER_PARALLEL)
+        log.info('auto-updater: %d 个订阅组到期, 并行 %d', len(due), workers)
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            futs = {ex.submit(self.sm.update, g['id']): g for g in due}
+            for fut in as_completed(futs):
+                g = futs[fut]
+                try:
+                    r = fut.result(timeout=SUB_UPDATE_TIMEOUT)
+                    log.info('auto-updater: 刷新 %s, 成功 %d / 错误 %d',
+                             g.get('name'), len(r.get('added', [])), len(r.get('errors', [])))
+                except Exception as e:
+                    log.warning('auto-updater: 刷新 %s 失败: %s', g.get('name'), e)
