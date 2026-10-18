@@ -7,7 +7,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from .queue import TaskQueue
-from .sources import SourceManager
+from .sources import SourceManager, SubscriptionManager, AutoUpdater
 
 BASE = Path(__file__).resolve().parent.parent
 DATA_DIR = Path(os.environ.get('DATA_DIR', str(BASE / 'data'))).resolve()
@@ -18,19 +18,25 @@ BRIDGE = BASE / 'bridge.mjs'
 NODE = os.environ.get('NODE', 'node')
 
 sm = SourceManager(DATA_DIR, BRIDGE, NODE)
+subm = SubscriptionManager(DATA_DIR, sm)
+auto_updater = AutoUpdater(subm)
 tq = TaskQueue(CONCURRENCY)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     sm.init()
+    subm.init()
     tq.start()
+    auto_updater.start()
     yield
+    auto_updater.stop()
     sm.close_all()
 
 
 app = FastAPI(title='MusicArchiver', lifespan=lifespan)
 app.state.sm = sm
+app.state.subm = subm
 app.state.tq = tq
 app.state.data_dir = DATA_DIR
 
