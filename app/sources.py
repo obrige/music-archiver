@@ -38,23 +38,32 @@ SCORE_SAVE_INTERVAL = 30
 BATCH_IMPORT_PARALLEL = 4
 STRICT_ACTION_CHECK = True
 
-# 版本号提取: 匹配 V + 6位 YYMMDD, 如 V261017 → 2026-10-17
-# 适用: GitHub release 风格(如 guoyue2010/lxmusic-, V+YYMMDD 命名规律)
-_VERSION_RE = re.compile(r'V(\d{2})(\d{2})(\d{2})')
+# 版本号提取: 按匹配优先级 (适用于 GitHub release / 自建 URL 等常见命名规律)
+#   1. [Vv]?(\d{2})(\d{2})(\d{2})           e.g. V261017, v260907 → '2026-10-17'
+#   2. (\d{4})(\d{2})(\d{2})                e.g. 20261017        → '2026-10-17'
+#   3. [Vv]?(\d+)\.(\d+)\.(\d+)              e.g. v1.2.3          → 'v1.2.3'
+_VERSION_PATTERNS = [
+    (re.compile(r'[Vv]?(\d{2})(\d{2})(\d{2})'), lambda m: f'20{m.group(1)}-{m.group(2)}-{m.group(3)}'),
+    (re.compile(r'(\d{4})(\d{2})(\d{2})'), lambda m: f'{m.group(1)}-{m.group(2)}-{m.group(3)}' if 2020 <= int(m.group(1)) <= 2099 else None),
+    (re.compile(r'[Vv]?(\d+)\.(\d+)\.(\d+)'), lambda m: f'v{m.group(1)}.{m.group(2)}.{m.group(3)}'),
+]
 
 
 def _extract_version(text):
-    """从 URL/redirect 目标提取 V+YYMMDD 版本. 返回 'YYYY-MM-DD' 或 None."""
+    """从 URL/redirect 目标提取版本字符串. 适配常见命名规律(优先级 V+YYMMDD > YYYYMMDD > semver)."""
     if not text:
         return None
-    m = _VERSION_RE.search(text)
-    if not m:
-        return None
-    yy, mm, dd = m.groups()
-    try:
-        return f'20{yy}-{mm}-{dd}'
-    except Exception:
-        return None
+    for rx, fmt in _VERSION_PATTERNS:
+        m = rx.search(text)
+        if not m:
+            continue
+        try:
+            v = fmt(m)
+            if v:
+                return v
+        except Exception:
+            continue
+    return None
 
 
 class SourceScore:
@@ -763,7 +772,6 @@ class SourceManager:
                 pass
 
     def import_from_url_zip(self, url):
-        """下载 URL 指向的 ZIP 后批量导入. 返回 (result, final_url) 以便上层识别重定向后的真实版本."""
         req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
         with urllib.request.urlopen(req, timeout=60) as r:
             if r.status != 200:
@@ -829,7 +837,6 @@ class SubscriptionManager:
         self.store_file = self.data_dir / 'subscriptions.json'
         self.sm = source_manager
         self.groups = []
-        # URL -> 解析到的版本字符串 (如 '2026-10-17'), 用于观测和未来跳过未变化版本
         self.last_versions = {}  # gid -> { url: 'YYYY-MM-DD' }
         self._locks = {}
         self._locks_guard = threading.Lock()
@@ -853,7 +860,6 @@ class SubscriptionManager:
 
     def _save(self):
         self.data_dir.mkdir(parents=True, exist_ok=True)
-        # 把内存中的 last_versions 写回每个 group
         for g in self.groups:
             gid = g.get('id')
             if gid and gid in self.last_versions:
@@ -899,7 +905,7 @@ class SubscriptionManager:
             'lastUpdate': None,
             'sources': [],
             'lastErrorCount': 0,
-            'lastVersions': {},  # URL -> 'YYYY-MM-DD'
+            'lastVersions': {},
         })
         self._save()
         return gid
@@ -933,7 +939,7 @@ class SubscriptionManager:
                     log.warning('清旧源 %s 失败: %s', sid, ex)
             g['sources'] = []
             new_sids, errors = [], []
-            per_url_ver = {}  # 本轮抓到的 url -> version
+            per_url_ver = {}
             for item in (g.get('urls') or []):
                 url = (item.get('url') if isinstance(item, dict) else item) or ''
                 kind = (item.get('kind') if isinstance(item, dict) else 'js') or 'js'
@@ -958,7 +964,6 @@ class SubscriptionManager:
                         else:
                             h = ret
                         new_sids.append(h.id)
-                    # 提取版本: 优先用重定向后的 final URL, 否则用原 URL
                     ver = _extract_version(final_url or url)
                     if ver:
                         per_url_ver[url] = ver
@@ -974,8 +979,7 @@ class SubscriptionManager:
                 self.last_versions[gid] = per_url_ver
                 g['lastVersions'] = per_url_ver
             self._save()
-            return {'added': new_sids, 'errors': errors, 'lastUpdate': g['lastUpdate'],
-                    'versions': per_url_ver}
+            return {'added': new_sids, 'errors': errors, 'lastUpdate': g['lastUpdate'], 'versions': per_url_ver}
 
 
 class AutoUpdater:
