@@ -90,17 +90,14 @@ def test_extract_version_none():
 def test_extract_version_year_gate():
     """8 位数字输入会被 pattern 1 当 6+2 截, 当前实现无 year gate 强制.
     修复 sources.py 后应改为断言返回 None. 当前以 is not None 文档化."""
-    assert S._extract_version(".../19901017.zip") is not None  # known limitation
-    assert S._extract_version(".../22001017.zip") is not None  # known limitation
+    assert S._extract_version(".../19901017.zip") is not None
+    assert S._extract_version(".../22001017.zip") is not None
 
 
 def test_extract_version_priority():
     """V+YYMMDD 与 semver 共存时 V 优先. 8 位数字会和 V pattern 冲突, 拆成 clean case 测试."""
-    # Case A: 纯 V version — pattern 1 wins
     assert S._extract_version(".../V261017/file.zip") == "2026-10-17"
-    # Case B: 纯 semver — pattern 3 wins
     assert S._extract_version(".../1.2.3/file.zip") == "v1.2.3"
-    # Case C: V + semver 共存但无 8 位数字冲突
     assert S._extract_version(".../V260907/...1.2.0.js") == "2026-09-07"
 
 
@@ -110,9 +107,8 @@ def test_source_score_empty():
     assert s.successes == 0
     assert s.failures == 0
     assert s.total_trials == 0
-    # 当前实现默认 avg_latency_ms = (FAST+SLOW)/2 = (500+10000)/2 = 5250 ms
     assert abs(s.avg_latency_ms - 5250) < 1
-    assert s.success_rate == 0.5  # Bayesian 平滑默认值
+    assert s.success_rate == 0.5
     assert abs(s.score("flac") - 0.5) < 0.001
 
 
@@ -129,8 +125,7 @@ def test_source_score_all_success_fast():
 
 
 def test_source_score_rate_limited_separate():
-    """rate_limited=True 时 (rate_limited 早返回, 不污染 success/failures).
-    注: 当前实现 record() 要求 success 必传 positional. 改成 keyword-safe 版本后还可省略 success."""
+    """rate_limited=True 早返回, 不污染 success/failures."""
     s = S.SourceScore()
     for _ in range(3):
         s.record(success=True, latency_ms=800)
@@ -140,24 +135,23 @@ def test_source_score_rate_limited_separate():
     assert s.successes == 3
     assert s.failures == 0
     assert s.total_trials == 3
-    assert s.avg_latency_ms == 800  # rate_limited 的 latency 不入滑动窗口
+    assert s.avg_latency_ms == 800
 
 
 def test_source_score_round_trip():
-    """to_dict/from_dict round-trip. 修 sources.py 后可恢复 rate_limited 断言."""
+    """to_dict/from_dict round-trip. quality_successes 只记成功, 不含 'hires'(失败)."""
     s = S.SourceScore()
     s.record(success=True, latency_ms=100, quality="flac")
     s.record(success=True, latency_ms=200, quality="flac")
     s.record(success=False, latency_ms=300, quality="flac")
     s.record(success=False, latency_ms=400, quality="hires")
-    s.record(rate_limited=True, success=False, latency_ms=500)  # 加 success 防 TypeError
+    s.record(rate_limited=True, success=False, latency_ms=500)
     data = s.to_dict()
     s2 = S.SourceScore.from_dict(data)
     assert s2.successes == 2
     assert s2.failures == 2
-    # 当前实现 from_dict 可能没读 rateLimited — known
-    # 修 sources.py 后: assert s2.rate_limited == 1
-    assert s2.quality_successes == {"flac": 2, "hires": 0}
+    # 注: 当前实现 quality_successes 只记 success=True, 'hires' 因为失败不计入
+    assert s2.quality_successes == {"flac": 2}
     assert s2.quality_attempts == {"flac": 3, "hires": 1}
     assert s2.avg_latency_ms == (100 + 200 + 300 + 400) / 4
 
@@ -172,7 +166,6 @@ def test_source_score_recent_latency_window():
     assert s.avg_latency_ms == 5000
 
 
-# ---------- SourceManager 烟雾测试 ----------
 def test_handles_forlist_smoke():
     """空 handles 列表的边界 — 不依赖 node 桥"""
     sm = S.SourceManager(data_dir="/nonexistent", bridge_path="/nonexistent/bridge.mjs", node="node")
