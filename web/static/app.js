@@ -6,6 +6,7 @@
     tab: 'search', platform: 'wy', query: '', sources: [], extraOk: {}, activeSourceId: '',
     searchList: [], tasks: [], library: [], sseState: '未连接', now: null,
     subEditor: null,  // 当前正在构建的订阅组 URL 列表: { urls: [{url, kind}] }
+    subBusy: null,    // 当前正在刷新的订阅组 id(前端禁用按钮)
   }
 
   // 平台显示名与可搜索平台
@@ -42,6 +43,19 @@
     return String(s == null ? '' : s)
       .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
       .replace(/"/g, '&quot;').replace(/'/g, '&#39;')
+  }
+
+  // 友好时间显示: "刚刚" / "5 分钟前" / "2 小时前" / "3 天前" / "2024-01-15"
+  function timeAgo(ms) {
+    if (!ms) return '从未'
+    var diff = Math.floor(Date.now() / 1000 - ms / 1000)
+    if (diff < 5) return '刚刚'
+    if (diff < 60) return diff + ' 秒前'
+    if (diff < 3600) return Math.floor(diff / 60) + ' 分钟前'
+    if (diff < 86400) return Math.floor(diff / 3600) + ' 小时前'
+    if (diff < 86400 * 30) return Math.floor(diff / 86400) + ' 天前'
+    var d = new Date(ms)
+    return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0')
   }
 
   function api(path, opts) {
@@ -239,7 +253,11 @@
       .then(function (r) {
         refreshSources()
         var added = (r.added || []).length, failed = (r.failed || []).length
-        toast('ZIP ' + f.name + ': 成功 ' + added + ' / 失败 ' + failed, added ? 'success' : 'warn')
+        if (r && r.detail && /过大|413/.test(r.detail)) {
+          toast('ZIP 太大 (上限 200MB, 可调 MAX_ZIP_UPLOAD_MB 环境变量)', 'warn')
+        } else {
+          toast('ZIP ' + f.name + ': 成功 ' + added + ' / 失败 ' + failed, added ? 'success' : 'warn')
+        }
       })
       .catch(function (e) { toast('ZIP 导入失败: ' + e.message) })
     e.target.value = ''
@@ -273,14 +291,19 @@
       var tbody = $('sub-tbody')
       toggleEmpty('sub-empty', list)
       tbody.innerHTML = list.map(function (g) {
-        var last = g.lastUpdate ? new Date(g.lastUpdate).toLocaleString() : '从未'
+        var busy = state.subBusy === g.id
+        var last = timeAgo(g.lastUpdate)
+        // 错误数 badge: 上一轮失败 > 0 时显示
+        var errBadge = (g.lastErrorCount > 0)
+          ? '<span class="badge failed" title="上一轮 ' + g.lastErrorCount + ' 个错误">⚠ ' + g.lastErrorCount + ' 错</span> '
+          : (g.lastUpdate ? '<span class="badge success">✓</span> ' : '')
         return '<tr>' +
           '<td><strong>' + esc(g.name) + '</strong></td>' +
           '<td>' + (g.urls || []).length + '</td>' +
           '<td>每 ' + (g.intervalMin || 60) + ' 分</td>' +
-          '<td>' + last + '</td>' +
+          '<td>' + errBadge + last + '</td>' +
           '<td>' +
-            '<button data-sub-refresh="' + esc(g.id) + '">立即刷新</button> ' +
+            '<button data-sub-refresh="' + esc(g.id) + '"' + (busy ? ' disabled' : '') + '>' + (busy ? '刷新中…' : '立即刷新') + '</button> ' +
             '<button data-sub-del="' + esc(g.id) + '">删除</button>' +
           '</td>' +
         '</tr>'
@@ -344,12 +367,17 @@
   }
 
   function refreshSub(gid) {
+    if (state.subBusy === gid) return  // 已在刷, 跳过
+    state.subBusy = gid
+    renderSubs()  // 立即禁用按钮
     api('/api/subscriptions/' + encodeURIComponent(gid) + '/refresh', { method: 'POST' })
       .then(function (r) {
-        toast('已刷新: 导入 ' + (r.added || []).length + ' / 错误 ' + (r.errors || []).length, 'success')
+        var n = (r.added || []).length, e = (r.errors || []).length
+        toast('已刷新: 导入 ' + n + ' / 错误 ' + e, e ? 'warn' : 'success')
         renderSubs(); refreshSources()
       })
       .catch(function (e) { toast('刷新失败: ' + e.message) })
+      .then(function () { state.subBusy = null; renderSubs() }, function () { state.subBusy = null; renderSubs() })
   }
   function removeSub(gid) {
     if (!confirm('删除订阅组? 该组导入的音源会被清理')) return
