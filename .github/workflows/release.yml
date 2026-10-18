@@ -1,0 +1,55 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Build source archives
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          VERSION="${TAG#v}"
+          mkdir -p dist
+          zip -r "dist/music-archiver-${VERSION}-source.zip" . \
+            -x ".git/*" \
+            -x ".github/*" \
+            -x "dist/*" \
+            -x "**/__pycache__/*" \
+            -x "**/*.pyc" \
+            -x "**/.DS_Store" \
+            -x "node_modules/*" \
+            -x ".venv/*" \
+            -x "venv/*"
+          tar --exclude='.git' \
+              --exclude='.github' \
+              --exclude='dist' \
+              --exclude='__pycache__' \
+              --exclude='*.pyc' \
+              --exclude='node_modules' \
+              --exclude='.venv' \
+              --exclude='venv' \
+              -czf "dist/music-archiver-${VERSION}-source.tar.gz" .
+          ls -lh dist
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/music-archiver-*-source.zip
+            dist/music-archiver-*-source.tar.gz
+          generate_release_notes: true
+          fail_on_unmatched_files: false
+          prerelease: ${{ contains(github.ref_name, '-') }}
