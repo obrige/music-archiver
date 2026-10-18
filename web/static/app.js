@@ -5,6 +5,7 @@
   var state = {
     tab: 'search', platform: 'wy', query: '', sources: [], extraOk: {}, activeSourceId: '',
     searchList: [], tasks: [], library: [], sseState: '未连接', now: null,
+    subEditor: null,  // 当前正在构建的订阅组 URL 列表: { urls: [{url, kind}] }
   }
 
   // 平台显示名与可搜索平台
@@ -18,7 +19,6 @@
     'dolby': '杜比全景声', 'dolby5.1': '杜比5.1', 'atmos': '杜比全景声', 'atmos_plus': '杜比全景声+',
     'sky': '臻品全景声', 'jyeffect': '臻品音效', 'jymaster': '臻品母带', 'master': '母带', 'vip': 'VIP 专属',
   }
-  // 智能音质显示名: 未收录的音质按关键词识别
   function qname(q) {
     if (QUALITY_NAMES[q]) return QUALITY_NAMES[q]
     var s = String(q).toLowerCase()
@@ -53,7 +53,6 @@
     }).then(function (r) { return r.json() })
   }
 
-  // ---------- 工具 ----------
   function durText(d) {
     if (!d) return '-'
     var s = Math.round(d / 1000)
@@ -74,7 +73,7 @@
     return '<span class="badge ' + cls + '">' + txt + '</span>'
   }
 
-  // ---------- UI 提示(toast) ----------
+  // ---------- toast ----------
   function toast(msg, type) {
     var box = document.getElementById('toast-box')
     if (!box) {
@@ -108,19 +107,16 @@
     })
     if (tab === 'tasks') loadTasks()
     if (tab === 'library') loadLib()
-    if (tab === 'settings') loadSettings()
+    if (tab === 'settings') { loadSettings(); renderSubs() }
   }
 
   // ---------- 音源与平台 ----------
-  // 官方 5 平台常驻; 非官方平台(汽水等)仅显示实测通过的
   var OFFICIAL = ['wy', 'kg', 'tx', 'kw', 'mg']
   function renderPlatforms() {
     var sel = $('platform')
     var available = []
     var seen = {}
-    // 官方常驻
     OFFICIAL.forEach(function (k) { if (!seen[k]) { seen[k] = true; available.push(k) } })
-    // 非官方: 仅已通过搜索实测的
     Object.keys(state.extraOk || {}).forEach(function (k) {
       if (state.extraOk[k] && !seen[k]) { seen[k] = true; available.push(k) }
     })
@@ -137,12 +133,10 @@
     sel.value = state.platform
   }
 
-  // 从实测列表中选最高音质(默认播放用)
   function bestEntry(list) {
     var best = null
     ;(list || []).forEach(function (e) {
       if (!best) { best = e; return }
-      // 按实测规格选最高: 采样率优先, 其次位深
       var a = (e.sr || 0) * 1000 + (e.bits || 0)
       var b = (best.sr || 0) * 1000 + (best.bits || 0)
       if (a > b) best = e
@@ -175,7 +169,6 @@
     }).catch(function () {})
   }
 
-  // 实测非官方平台: 脚本声明了搜索就测一次, 失败则不出现在下拉
   function testExtraPlatforms() {
     var extras = {}
     state.sources.forEach(function (s) {
@@ -192,6 +185,7 @@
     })
   }
 
+  // ---------- 音源导入: 单 / 批量 / 压缩包 ----------
   function importByUrl() {
     var url = $('import-url').value.trim()
     if (!url) return
@@ -209,6 +203,58 @@
     }).then(function () { return refreshSources() })
       .then(function () { toast('已导入 ' + f.name, 'success') })
       .catch(function (err) { toast('导入失败: ' + err.message) })
+    e.target.value = ''
+  }
+
+  function importJsFilesMulti(files, tag) {
+    var jsFiles = (files || []).filter(function (f) { return f.name.toLowerCase().endsWith('.js') })
+    if (!jsFiles.length) return toast(tag + ' 内没有 .js 文件', 'warn')
+    var fd = new FormData()
+    jsFiles.forEach(function (f) { fd.append('files', f) })
+    fetch('/api/sources/import-files', { method: 'POST', body: fd })
+      .then(function (r) { return r.json() })
+      .then(function (r) {
+        refreshSources()
+        var added = (r.added || []).length, failed = (r.failed || []).length
+        toast(tag + ': 成功 ' + added + ' / 失败 ' + failed, added ? 'success' : 'warn')
+      })
+      .catch(function (e) { toast('批量导入失败: ' + e.message) })
+  }
+
+  function importByFolder(e) {
+    importJsFilesMulti(Array.from(e.target.files || []), '文件夹')
+    e.target.value = ''
+  }
+  function importByMulti(e) {
+    importJsFilesMulti(Array.from(e.target.files || []), '多选')
+    e.target.value = ''
+  }
+  function importByZip(e) {
+    var f = e.target.files && e.target.files[0]
+    if (!f) return
+    var fd = new FormData()
+    fd.append('file', f)
+    fetch('/api/sources/import-zip', { method: 'POST', body: fd })
+      .then(function (r) { return r.json() })
+      .then(function (r) {
+        refreshSources()
+        var added = (r.added || []).length, failed = (r.failed || []).length
+        toast('ZIP ' + f.name + ': 成功 ' + added + ' / 失败 ' + failed, added ? 'success' : 'warn')
+      })
+      .catch(function (e) { toast('ZIP 导入失败: ' + e.message) })
+    e.target.value = ''
+  }
+  function importByZipUrl() {
+    var url = $('import-zip-url').value.trim()
+    if (!url) return
+    api('/api/sources/import-zip-url', { method: 'POST', body: { url: url } })
+      .then(function (r) {
+        refreshSources()
+        var added = (r.added || []).length
+        toast('ZIP URL: 成功 ' + added, added ? 'success' : 'warn')
+        $('import-zip-url').value = ''
+      })
+      .catch(function (e) { toast('ZIP URL 导入失败: ' + e.message) })
   }
 
   function removeSource(id) {
@@ -217,6 +263,98 @@
         if (state.activeSourceId === id) state.activeSourceId = ''
         return refreshSources()
       })
+      .catch(function (e) { toast('删除失败: ' + e.message) })
+  }
+
+  // ---------- 订阅分组 ----------
+  function renderSubs() {
+    api('/api/subscriptions').then(function (rs) {
+      var list = rs || []
+      var tbody = $('sub-tbody')
+      toggleEmpty('sub-empty', list)
+      tbody.innerHTML = list.map(function (g) {
+        var last = g.lastUpdate ? new Date(g.lastUpdate).toLocaleString() : '从未'
+        return '<tr>' +
+          '<td><strong>' + esc(g.name) + '</strong></td>' +
+          '<td>' + (g.urls || []).length + '</td>' +
+          '<td>每 ' + (g.intervalMin || 60) + ' 分</td>' +
+          '<td>' + last + '</td>' +
+          '<td>' +
+            '<button data-sub-refresh="' + esc(g.id) + '">立即刷新</button> ' +
+            '<button data-sub-del="' + esc(g.id) + '">删除</button>' +
+          '</td>' +
+        '</tr>'
+      }).join('')
+    }).catch(function () {})
+  }
+
+  function renderSubUrls() {
+    var box = $('sub-urls')
+    if (!box) return
+    var urls = (state.subEditor && state.subEditor.urls) || []
+    if (!urls.length) { box.innerHTML = '<span class="hint">尚未加入 URL</span>'; return }
+    box.innerHTML = urls.map(function (u, i) {
+      return '<div style="display:flex;gap:6px;align-items:center;padding:2px 0">' +
+        '<span class="badge ' + (u.kind === 'zip' ? 'running' : 'success') + '">' + esc(u.kind) + '</span>' +
+        '<code style="flex:1;word-break:break-all;font-size:12px">' + esc(u.url) + '</code>' +
+        '<button data-sub-url-del="' + i + '">×</button>' +
+      '</div>'
+    }).join('')
+  }
+
+  function subAddUrl() {
+    var url = $('sub-url').value.trim()
+    if (!url) return
+    var kind = $('sub-url-kind').value
+    if (!state.subEditor) state.subEditor = { urls: [] }
+    state.subEditor.urls.push({ url: url, kind: kind })
+    $('sub-url').value = ''
+    $('sub-editor').style.display = ''
+    renderSubUrls()
+  }
+  function subDelUrl(i) {
+    if (!state.subEditor) return
+    state.subEditor.urls.splice(i, 1)
+    renderSubUrls()
+  }
+  function clearSubEditor() {
+    state.subEditor = null
+    $('sub-editor').style.display = 'none'
+    $('sub-url').value = ''
+    renderSubUrls()
+  }
+
+  function addSub() {
+    var name = $('sub-name').value.trim()
+    if (!name) return toast('需要订阅组名称', 'warn')
+    var intervalMin = parseInt($('sub-interval').value) || 60
+    var urls = (state.subEditor && state.subEditor.urls) || []
+    if (!urls.length) return toast('至少加入一个 URL', 'warn')
+    api('/api/subscriptions', { method: 'POST', body: { name, urls, intervalMin } })
+      .then(function (r) {
+        $('sub-name').value = ''
+        $('sub-interval').value = 60
+        clearSubEditor()
+        renderSubs()
+        refreshSources()
+        if (r.initialFetchError) toast('已创建, 首次拉取失败: ' + r.initialFetchError, 'warn')
+        else toast('已创建订阅组, ' + urls.length + ' 个 URL 已拉取', 'success')
+      })
+      .catch(function (e) { toast('创建失败: ' + e.message) })
+  }
+
+  function refreshSub(gid) {
+    api('/api/subscriptions/' + encodeURIComponent(gid) + '/refresh', { method: 'POST' })
+      .then(function (r) {
+        toast('已刷新: 导入 ' + (r.added || []).length + ' / 错误 ' + (r.errors || []).length, 'success')
+        renderSubs(); refreshSources()
+      })
+      .catch(function (e) { toast('刷新失败: ' + e.message) })
+  }
+  function removeSub(gid) {
+    if (!confirm('删除订阅组? 该组导入的音源会被清理')) return
+    api('/api/subscriptions/' + encodeURIComponent(gid), { method: 'DELETE' })
+      .then(function () { renderSubs(); refreshSources(); toast('已删除', 'success') })
       .catch(function (e) { toast('删除失败: ' + e.message) })
   }
 
@@ -241,7 +379,6 @@
       } else if (s._verifying) {
         chips = '<span class="hint">校验中…</span>'
       } else {
-        // 不显示官方API音质标签(不先入为主), 只标 待校验
         chips = '<span class="hint">待校验</span>'
       }
       return '<tr>' +
@@ -281,8 +418,6 @@
     }).catch(function () {})
   }
 
-  // 实际解析校验音质: 不信任官方标签, 相同链接按低音质标注, 自动去重
-  // 该平台所有音源声明的全部音质(不遗漏高音质标签)
   function declaredQualitys() {
     var qset = {}
     var black = { '128k': 1, '192k': 1, '320k': 1 }
@@ -293,13 +428,11 @@
     return Object.keys(qset)
   }
 
-  // 实时校验: 所有音源并行解析, 每个源完成立即合并显示
   function mergeVerified(song, list) {
     ;(list || []).forEach(function (e) {
       var key = e.size || e.url
       var old = song._vsize[key]
       if (!old) { song._vsize[key] = e; return }
-      // 同大小(同一文件): 保留更高实测规格
       if ((e.sr || 0) * 1000 + (e.bits || 0) > (old.sr || 0) * 1000 + (old.bits || 0)) song._vsize[key] = e
     })
     song._verifiedQualities = Object.values(song._vsize)
@@ -315,7 +448,6 @@
     var sources = state.sources.filter(function (s) { return s.sources && s.sources[state.platform] })
     var remaining = sources.length
     if (!remaining) { song._verifying = false; renderSearchRows(); return Promise.resolve() }
-    // 单请求 + 服务端全并发 + SSE 流式: 每个音源完成立即推送合并
     return fetch('/api/resolve-all/stream', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ platform: state.platform, song: pickSong(song), qualities: [] }),
@@ -371,7 +503,6 @@
   }
 
   function resolveSong(song) {
-    // 默认播放最高实测音质; 未校验则现场校验后取最高
     var best = bestEntry(song._verifiedQualities)
     if (best) return Promise.resolve({ url: best.url, spec: best.spec })
     return verifySong(song).then(function () {
@@ -586,15 +717,13 @@
       }).catch(function (e) { toast('创建失败: ' + e.message) })
     })
     $('lib-tbody').addEventListener('click', function (e) {
-      var act = e.target.getAttribute('data-act')
-      var i = Number(e.target.getAttribute('data-i'))
+      var t = e.target
+      var act = t.getAttribute('data-act')
+      var i = Number(t.getAttribute('data-i'))
       if (act === 'open' && state.library[i]) enterLib(state.library[i])
+      if (act === 'del') delItem(i)
     })
     $('lib-nav').addEventListener('click', function (e) { if (e.target.id === 'lib-up') upLib() })
-    $('lib-tbody').addEventListener('click', function (e) {
-      var t = e.target
-      if (t.getAttribute('data-act') === 'del') delItem(Number(t.getAttribute('data-i')))
-    })
 
     $('btn-save-cfg').addEventListener('click', saveCfg)
     $('btn-import-url').addEventListener('click', importByUrl)
@@ -603,9 +732,31 @@
       var id = e.target.getAttribute('data-src-del')
       if (id) removeSource(id)
     })
+
+    // 音源批量 / 压缩包
+    if ($('import-folder')) $('import-folder').addEventListener('change', importByFolder)
+    if ($('import-multi')) $('import-multi').addEventListener('change', importByMulti)
+    if ($('import-zip')) $('import-zip').addEventListener('change', importByZip)
+    if ($('btn-import-zip-url')) $('btn-import-zip-url').addEventListener('click', importByZipUrl)
+
+    // 订阅分组
+    if ($('btn-add-sub')) {
+      $('btn-add-sub').addEventListener('click', addSub)
+      $('btn-sub-add-url').addEventListener('click', subAddUrl)
+      $('sub-tbody').addEventListener('click', function (e) {
+        var t = e.target
+        var rid = t.getAttribute('data-sub-refresh')
+        var did = t.getAttribute('data-sub-del')
+        if (rid) refreshSub(rid)
+        else if (did) removeSub(did)
+      })
+      $('sub-urls').addEventListener('click', function (e) {
+        var i = e.target.getAttribute('data-sub-url-del')
+        if (i !== null) subDelUrl(Number(i))
+      })
+    }
   }
 
-  // ---------- 启动 ----------
   bind()
   refreshSources()
   loadTasks()
