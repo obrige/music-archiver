@@ -5,8 +5,8 @@
   var state = {
     tab: 'search', platform: 'wy', query: '', sources: [], extraOk: {}, activeSourceId: '',
     searchList: [], tasks: [], library: [], sseState: '未连接', now: null,
-    subEditor: null,  // 当前正在构建的订阅组 URL 列表: { urls: [{url, kind}] }
-    subBusy: null,    // 当前正在刷新的订阅组 id(前端禁用按钮)
+    subEditor: null,
+    subBusy: null,
   }
 
   // 平台显示名与可搜索平台
@@ -45,7 +45,6 @@
       .replace(/"/g, '&quot;').replace(/'/g, '&#39;')
   }
 
-  // 友好时间显示: "刚刚" / "5 分钟前" / "2 小时前" / "3 天前" / "2024-01-15"
   function timeAgo(ms) {
     if (!ms) return '从未'
     var diff = Math.floor(Date.now() / 1000 - ms / 1000)
@@ -56,6 +55,17 @@
     if (diff < 86400 * 30) return Math.floor(diff / 86400) + ' 天前'
     var d = new Date(ms)
     return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0')
+  }
+
+  // 综合分: 0-1, 对齐后端 SourceScore.score(). 用 0.5 占位质量分(无 per-quality 数据)
+  function compositeScore(s) {
+    var sc = s.score || {}
+    var n = (sc.successes || 0) + (sc.failures || 0)
+    if (n === 0) return 0.5  // 无数据, 中性
+    var sr = sc.successRate || 0
+    var avg = sc.avgLatencyMs || 5000
+    var spd = Math.max(0, Math.min(1, (10000 - avg) / 9500))
+    return 0.4 * 0.5 + 0.3 * spd + 0.3 * sr  // 质量分 0.5 (无数据), 速度+可靠性加权
   }
 
   function api(path, opts) {
@@ -85,6 +95,21 @@
     else txt = Math.floor(diff / 86400) + '天前'
     var cls = diff < 86400 ? 'success' : 'skipped'
     return '<span class="badge ' + cls + '">' + txt + '</span>'
+  }
+
+  // 音源评分 cell: 成功率 badge + 延迟 + 综合分 + 调用次数
+  function scoreHtml(s) {
+    var sc = s.score || {}
+    var n = (sc.successes || 0) + (sc.failures || 0)
+    if (n === 0) return '<span class="hint">未使用</span>'
+    var sr = sc.successRate || 0
+    var avg = sc.avgLatencyMs || 0
+    var srPct = Math.round(sr * 100)
+    var srCls = sr >= 0.7 ? 'success' : (sr >= 0.4 ? 'running' : 'failed')
+    var lat = avg < 1000 ? Math.round(avg) + 'ms' : (avg < 5000 ? (avg / 1000).toFixed(1) + 's' : Math.round(avg / 1000) + 's')
+    var comp = compositeScore(s).toFixed(2)
+    return '<span class="badge ' + srCls + '">' + srPct + '%</span> ' +
+           '<span style="color:#64748b;font-size:12px">' + lat + ' · 分 ' + comp + ' · n=' + n + '</span>'
   }
 
   // ---------- toast ----------
@@ -163,12 +188,16 @@
     var tbody = $('source-tbody')
     toggleEmpty('source-empty', state.sources)
     if (!state.sources.length) { tbody.innerHTML = ''; return }
-    tbody.innerHTML = state.sources.map(function (s) {
+    // 按综合分降序: 高分源置顶
+    var sorted = state.sources.slice().sort(function (a, b) { return compositeScore(b) - compositeScore(a) })
+    tbody.innerHTML = sorted.map(function (s) {
       var detail = Object.keys(s.sources || {}).map(function (k) {
         return (PLATFORM_NAMES[k] || k) + ' ' + (s.sources[k].qualitys || []).join('/')
       }).join('、')
       return '<tr><td><strong>' + esc(s.name) + '</strong></td><td>' + esc(Object.keys(s.sources || {}).join(', ')) + '</td>' +
-        '<td>' + esc(detail) + '</td><td>' + lastSuccessHtml(s.lastSuccess) + '</td><td><button data-src-del="' + esc(s.id) + '">删除</button></td></tr>'
+        '<td>' + esc(detail) + '</td>' +
+        '<td>' + scoreHtml(s) + '</td>' +
+        '<td>' + lastSuccessHtml(s.lastSuccess) + '</td><td><button data-src-del="' + esc(s.id) + '">删除</button></td></tr>'
     }).join('')
 
     renderPlatforms()
@@ -265,7 +294,7 @@
   function importByZipUrl() {
     var url = $('import-zip-url').value.trim()
     if (!url) return
-    api('/api/sources/import-zip-url', { method: 'POST', body: { url: url } })
+    api('/api/sources/import-zip-url', { method: 'POST', body: { url } })
       .then(function (r) {
         refreshSources()
         var added = (r.added || []).length
@@ -293,7 +322,6 @@
       tbody.innerHTML = list.map(function (g) {
         var busy = state.subBusy === g.id
         var last = timeAgo(g.lastUpdate)
-        // 错误数 badge: 上一轮失败 > 0 时显示
         var errBadge = (g.lastErrorCount > 0)
           ? '<span class="badge failed" title="上一轮 ' + g.lastErrorCount + ' 个错误">⚠ ' + g.lastErrorCount + ' 错</span> '
           : (g.lastUpdate ? '<span class="badge success">✓</span> ' : '')
@@ -367,9 +395,9 @@
   }
 
   function refreshSub(gid) {
-    if (state.subBusy === gid) return  // 已在刷, 跳过
+    if (state.subBusy === gid) return
     state.subBusy = gid
-    renderSubs()  // 立即禁用按钮
+    renderSubs()
     api('/api/subscriptions/' + encodeURIComponent(gid) + '/refresh', { method: 'POST' })
       .then(function (r) {
         var n = (r.added || []).length, e = (r.errors || []).length
@@ -761,13 +789,11 @@
       if (id) removeSource(id)
     })
 
-    // 音源批量 / 压缩包
     if ($('import-folder')) $('import-folder').addEventListener('change', importByFolder)
     if ($('import-multi')) $('import-multi').addEventListener('change', importByMulti)
     if ($('import-zip')) $('import-zip').addEventListener('change', importByZip)
     if ($('btn-import-zip-url')) $('btn-import-zip-url').addEventListener('click', importByZipUrl)
 
-    // 订阅分组
     if ($('btn-add-sub')) {
       $('btn-add-sub').addEventListener('click', addSub)
       $('btn-sub-add-url').addEventListener('click', subAddUrl)
