@@ -1,11 +1,10 @@
-# 直接拉取 GHCR 镜像版本 —— 无需本地源码/Dockerfile
-# 与 docker-compose.yml(本地构建)并存, 二选一使用
+# 直接拉取 GHCR 镜像版本 —— 无需本地源码/Dockerfile, 也无需 build
+# 与 docker-compose.yml(本地 build:)并存, 二选一使用
 #
 # 用法:
-#   docker compose -f docker-compose.ghcr.yml pull    # 拉取镜像
-#   docker compose -f docker-compose.ghcr.yml up -d    # 启动
-#   docker compose -f docker-compose.ghcr.yml logs -f # 日志
-#   docker compose -f docker-compose.ghcr.yml down    # 停止
+#   docker compose -f docker-compose.ghcr.yml up -d     # 拉镜像 + 启动
+#   docker compose -f docker-compose.ghcr.yml logs -f   # 日志
+#   docker compose -f docker-compose.ghcr.yml down      # 停止
 #
 # 固定版本(避免 latest 漂移): 把下面的 image 改成具体 tag, 如 :1.0.0 / :sha-<commit>
 # 可选 tag 见: https://github.com/obrige/music-archiver/pkgs/container/music-archiver
@@ -14,7 +13,6 @@ services:
   music-archiver:
     image: ghcr.io/obrige/music-archiver:latest
     container_name: music-archiver
-    pull_policy: always
     ports:
       - "5245:5245"
     environment:
@@ -25,7 +23,8 @@ services:
       - ./data:/data
     restart: unless-stopped
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:5245/ >/dev/null || exit 1"]
+      # 镜像只有 python(无 wget/curl), 用 python 做 TCP 探活
+      test: ["CMD-SHELL", "python -c \"import socket; s=socket.socket(); s.settimeout(2); s.connect(('127.0.0.1', 5245)); s.close()\""]
       interval: 30s
       timeout: 5s
       retries: 3
