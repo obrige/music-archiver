@@ -2,11 +2,13 @@
 """音源管理: 洛雪音源脚本(JS)通过 node 子进程桥在沙箱中运行
 设计: 每次解析请求都启动全新桥进程, 用完即杀, 彻底避免进程卡死/管道堆积拖垮服务
 
-扩展(批次/压缩/订阅):
+扩展(批次/压缩/订阅/评分):
 - SourceManager.import_from_files: 多个 .js 文件批量导入(前端 multipart)
 - SourceManager.import_from_zip_path / _bytes / _url_zip: ZIP 批量导入(支持流式)
 - SubscriptionManager: 订阅分组(URL 列表 + 自动刷新间隔, per-group 锁防并发竞争)
 - AutoUpdater: 后台线程并行刷新到期订阅组
+- SourceScore: per-source 滚动统计(成功率/平均延迟/按音质成功率), 复合分用于智能选源
+- SourceManager.handles_for_score(): 按分数降序返回, 供 resolve-all 优先跑高分源
 """
 import io
 import json
@@ -25,17 +27,116 @@ log = logging.getLogger('musicarchiver.sources')
 
 BRIDGE_TIMEOUT = 35
 META_TIMEOUT = 15
-# 订阅间隔上下限(分钟)
 SUB_INTERVAL_MIN = 5
 SUB_INTERVAL_MAX = 10080  # 1 周
-# 订阅刷新单组超时(秒)
 SUB_UPDATE_TIMEOUT = 300
-# AutoUpdater 并行上限
 AUTOUPDATER_PARALLEL = 3
+SCORE_SAVE_INTERVAL = 30  # 评分落盘间隔(秒), 防每请求写盘
+
+
+class SourceScore:
+    """单源滚动统计: Bayesian 平滑成功率 + 滑动窗口平均延迟 + 按音质分桶成功率.
+    复合分 score = 0.4 × 音质匹配 + 0.3 × 速度 + 0.3 × 可靠性, 范围 [0, 1], 越高越优先."""
+    RECENT_WINDOW = 20           # 滑动窗口样本数
+    BAYES_PRIOR_TRIALS = 5       # 贝叶斯平滑先验次数(防冷启极端)
+    BAYES_PRIOR_SUCCESS = 2.5    # 贝叶斯平滑先验成功(0.5 = 中性)
+    LATENCY_FAST_MS = 500        # 这延迟以下算极快
+    LATENCY_SLOW_MS = 10000      # 这延迟以上算极慢
+    WEIGHT_QUALITY = 0.4
+    WEIGHT_SPEED = 0.3
+    WEIGHT_RELIABILITY = 0.3
+
+    def __init__(self):
+        self.successes = 0
+        self.failures = 0
+        self.last_success_at = None
+        self.last_failure_at = None
+        self.quality_attempts = {}   # quality -> int
+        self.quality_successes = {}
+        self.recent_latencies = []   # last RECENT_WINDOW (ms)
+
+    def record(self, success, latency_ms=None, quality=None):
+        if quality:
+            self.quality_attempts[quality] = self.quality_attempts.get(quality, 0) + 1
+        if success:
+            self.successes += 1
+            self.last_success_at = _time.time()
+            if latency_ms is not None:
+                self.recent_latencies.append(int(latency_ms))
+                if len(self.recent_latencies) > self.RECENT_WINDOW:
+                    self.recent_latencies.pop(0)
+            if quality:
+                self.quality_successes[quality] = self.quality_successes.get(quality, 0) + 1
+        else:
+            self.failures += 1
+            self.last_failure_at = _time.time()
+
+    @property
+    def total_trials(self):
+        return self.successes + self.failures
+
+    @property
+    def success_rate(self):
+        """Bayesian-smoothed: 极少调用时往 0.5 拉, 防极端"""
+        if self.total_trials == 0:
+            return 0.5
+        return (self.successes + self.BAYES_PRIOR_SUCCESS) / (self.total_trials + self.BAYES_PRIOR_TRIALS)
+
+    @property
+    def avg_latency_ms(self):
+        if self.recent_latencies:
+            return sum(self.recent_latencies) / len(self.recent_latencies)
+        return (self.LATENCY_FAST_MS + self.LATENCY_SLOW_MS) / 2  # 中位假设
+
+    def quality_score(self, quality):
+        """该源对此音质的把握: 0-1, 0.5 = 无数据"""
+        a = self.quality_attempts.get(quality, 0)
+        if a == 0:
+            return 0.5
+        s = self.quality_successes.get(quality, 0)
+        return (s + 1) / (a + 2)  # Bayesian 平滑
+
+    def score(self, requested_quality=None):
+        """综合分: 0-1, 越高越优先."""
+        if requested_quality:
+            qs = self.quality_score(requested_quality)
+        else:
+            # 无指定音质: 用总成功率
+            ta = sum(self.quality_attempts.values())
+            ts = sum(self.quality_successes.values())
+            qs = (ts + 1) / (ta + 2) if ta else 0.5
+        # 速度分: 0..1, LATENCY_FAST_MS -> 1, LATENCY_SLOW_MS -> 0
+        lat = self.avg_latency_ms
+        spd = max(0.0, min(1.0, (self.LATENCY_SLOW_MS - lat) / (self.LATENCY_SLOW_MS - self.LATENCY_FAST_MS)))
+        rel = self.success_rate
+        return qs * self.WEIGHT_QUALITY + spd * self.WEIGHT_SPEED + rel * self.WEIGHT_RELIABILITY
+
+    def to_dict(self):
+        return {
+            'successes': self.successes,
+            'failures': self.failures,
+            'successRate': round(self.success_rate, 3),
+            'avgLatencyMs': int(self.avg_latency_ms),
+            'lastSuccessAt': self.last_success_at,
+            'lastFailureAt': self.last_failure_at,
+            'qualitySuccess': dict(self.quality_successes),
+            'qualityAttempts': dict(self.quality_attempts),
+        }
+
+    @classmethod
+    def from_dict(cls, d):
+        s = cls()
+        s.successes = int(d.get('successes') or 0)
+        s.failures = int(d.get('failures') or 0)
+        s.last_success_at = d.get('lastSuccessAt')
+        s.last_failure_at = d.get('lastFailureAt')
+        s.quality_successes = dict(d.get('qualitySuccess') or {})
+        s.quality_attempts = dict(d.get('qualityAttempts') or {})
+        return s
 
 
 class LxScriptHandle:
-    def __init__(self, script_path, bridge_path, node='node'):
+    def __init__(self, script_path, bridge_path, node='node', on_dirty=None):
         self.script_path = str(script_path)
         self.bridge_path = str(bridge_path)
         self.node = node
@@ -43,6 +144,8 @@ class LxScriptHandle:
         self.name = ''
         self.sources = {}
         self.last_success = None
+        self.score = SourceScore()
+        self._on_dirty = on_dirty  # callback when score changes (用于触发持久化)
         # 单音源限速(不同音源互不干扰, 每个音源自身请求间隔 0.5s 防 429)
         self._rate_lock = threading.Lock()
         self._rate_last = [0.0]
@@ -119,16 +222,27 @@ class LxScriptHandle:
         finally:
             self._kill(proc)
 
+    def _record(self, success, latency_ms, quality):
+        """记录一次调用结果到评分系统; 标记脏, 由 SourceManager 周期落盘."""
+        self.score.record(success, latency_ms, quality)
+        if self._on_dirty:
+            try:
+                self._on_dirty()
+            except Exception:
+                log.exception('on_dirty callback failed')
+
     def resolve(self, source, song, quality):
+        t0 = _time.time()
         proc, q = self._spawn()
+        success = False
         try:
             req = {'source': source, 'action': 'musicUrl',
                    'info': {'musicInfo': dict(song), 'type': quality}}
             proc.stdin.write(json.dumps(req, ensure_ascii=False) + '\n')
             proc.stdin.flush()
-            deadline = time.time() + BRIDGE_TIMEOUT
+            deadline = _time.time() + BRIDGE_TIMEOUT
             while True:
-                remain = deadline - time.time()
+                remain = deadline - _time.time()
                 if remain <= 0:
                     raise RuntimeError('音源请求超时')
                 msg = q.get(timeout=remain)
@@ -140,40 +254,43 @@ class LxScriptHandle:
                 if msg.get('ok') is False:
                     raise RuntimeError(msg.get('error') or '音源解析失败')
                 if msg.get('ok'):
-                    self.last_success = time.time()
+                    success = True
+                    self.last_success = _time.time()
                     return msg.get('data') or {}
                 raise RuntimeError('音源返回格式无效')
         except queue.Empty:
             raise RuntimeError('音源请求超时')
         finally:
             self._kill(proc)
+            ms = int((_time.time() - t0) * 1000)
+            self._record(success, ms if success else None, quality)
 
     def _throttle(self):
         with self._rate_lock:
-            now = time.time()
+            now = _time.time()
             wait = self._rate_interval - (now - self._rate_last[0])
             if wait > 0:
-                time.sleep(wait)
-            self._rate_last[0] = time.time()
+                _time.sleep(wait)
+            self._rate_last[0] = _time.time()
 
     def resolve_multi(self, platform, song, qualities, overall_timeout=30):
         """同一桥进程内依次解析多个音质(校验用, 快 N 倍); 整体超时避免慢源拖累"""
         self._throttle()
         proc, q = self._spawn()
-        deadline_all = time.time() + overall_timeout
+        deadline_all = _time.time() + overall_timeout
         try:
             results = {}
             for quality in qualities:
-                if time.time() > deadline_all:
+                if _time.time() > deadline_all:
                     break
                 req = {'platform': platform, 'action': 'musicUrl',
                        'info': {'musicInfo': dict(song), 'type': quality}}
                 proc.stdin.write(json.dumps(req, ensure_ascii=False) + '\n')
                 proc.stdin.flush()
                 # 实时性: 单音质最多等 18s, 且不超过整体超时
-                deadline = min(time.time() + 18, deadline_all)
+                deadline = min(_time.time() + 18, deadline_all)
                 while True:
-                    remain = deadline - time.time()
+                    remain = deadline - _time.time()
                     if remain <= 0:
                         break
                     try:
@@ -191,23 +308,31 @@ class LxScriptHandle:
                         results[quality] = (msg.get('data') or {}).get('url')
                         break
             if results:
-                self.last_success = time.time()
+                self.last_success = _time.time()
             return results
         finally:
             self._kill(proc)
+            # 整体一次计为一次调用, 记到"无指定音质"的综合分
+            t_end = _time.time()
+            ms = int((t_end - deadline_all + overall_timeout) * 1000) if False else 0
+            # 暂用整体耗时估值(总超时作为上限)
+            ms = int(overall_timeout * 1000) if not results else int((overall_timeout - max(0, deadline_all - t_end)) * 1000)
+            self._record(bool(results), ms, None)
 
     def search(self, platform, keyword, page=1, limit=30):
         """脚本原生搜索(需音源声明 search/musicSearch action)"""
         actions = (self.sources.get(platform) or {}).get('actions') or []
         action = 'musicSearch' if 'musicSearch' in actions else 'search'
+        t0 = _time.time()
         proc, q = self._spawn()
+        success = False
         try:
             req = {'source': platform, 'action': action, 'info': {'keyword': keyword, 'page': page, 'limit': limit}}
             proc.stdin.write(json.dumps(req, ensure_ascii=False) + '\n')
             proc.stdin.flush()
-            deadline = time.time() + 30
+            deadline = _time.time() + 30
             while True:
-                remain = deadline - time.time()
+                remain = deadline - _time.time()
                 if remain <= 0:
                     raise RuntimeError('搜索超时')
                 msg = q.get(timeout=remain)
@@ -217,12 +342,15 @@ class LxScriptHandle:
                 if msg.get('ok') is False:
                     raise RuntimeError(msg.get('error') or '搜索失败')
                 if msg.get('ok'):
+                    success = True
                     data = msg.get('data') or {}
                     return data.get('list') or []
         except queue.Empty:
             raise RuntimeError('搜索超时')
         finally:
             self._kill(proc)
+            ms = int((_time.time() - t0) * 1000)
+            self._record(success, ms if success else None, None)
 
     def close(self):
         pass
@@ -236,29 +364,68 @@ class SourceManager:
         self.bridge_path = bridge_path
         self.node = node
         self.handles = {}
-        # _save 互斥锁 + 原子写入(临时文件 + os.replace)防并发损坏
+        # 原子写入 + 评分落盘
         self._save_lock = threading.Lock()
+        self._dirty = False
+        self._save_stop = threading.Event()
+        self._save_thread = None
 
     def init(self):
-        if not self.store_file.exists():
+        if self.store_file.exists():
+            try:
+                entries = json.loads(self.store_file.read_text('utf-8'))
+                recovered = 0
+                for e in entries:
+                    try:
+                        raw = e.get('raw') or ''
+                        script_file = self._write_script(e['id'], raw)
+                        h = LxScriptHandle(script_file, self.bridge_path, self.node, on_dirty=self._mark_dirty)
+                        h.id = e['id']
+                        h.last_success = e.get('lastSuccess')
+                        # 恢复评分
+                        score_data = e.get('score')
+                        if score_data:
+                            h.score = SourceScore.from_dict(score_data)
+                        self.handles[e['id']] = h
+                        recovered += 1
+                    except Exception as ex:
+                        log.warning('恢复音源 %s 失败: %s', e.get('name'), ex)
+                log.info('sources: 已恢复 %d 个音源', recovered)
+            except Exception as e:
+                log.warning('sources: 读取 sources.json 失败: %s', e)
+        # 启动周期落盘线程
+        self._start_periodic_save()
+
+    def _start_periodic_save(self):
+        if self._save_thread and self._save_thread.is_alive():
             return
-        try:
-            entries = json.loads(self.store_file.read_text('utf-8'))
-            recovered = 0
-            for e in entries:
+        self._save_thread = threading.Thread(target=self._save_loop, daemon=True, name='sources-save')
+        self._save_thread.start()
+        log.debug('sources-save: 后台落盘线程启动, 间隔 %ds', SCORE_SAVE_INTERVAL)
+
+    def _mark_dirty(self):
+        """评分变更回调: 标记脏, 落盘线程 30s 内写盘."""
+        self._dirty = True
+
+    def _save_loop(self):
+        while not self._save_stop.is_set():
+            # 可中断 sleep
+            for _ in range(SCORE_SAVE_INTERVAL):
+                if self._save_stop.is_set():
+                    return
+                _time.sleep(1)
+            if self._dirty:
+                self._dirty = False
                 try:
-                    raw = e.get('raw') or ''
-                    script_file = self._write_script(e['id'], raw)
-                    h = LxScriptHandle(script_file, self.bridge_path, self.node)
-                    h.id = e['id']
-                    h.last_success = e.get('lastSuccess')
-                    self.handles[e['id']] = h
-                    recovered += 1
-                except Exception as ex:
-                    log.warning('恢复音源 %s 失败: %s', e.get('name'), ex)
-            log.info('sources: 已恢复 %d 个音源', recovered)
-        except Exception as e:
-            log.warning('sources: 读取 sources.json 失败: %s', e)
+                    self._save()
+                    log.debug('sources-save: 评分落盘完成')
+                except Exception:
+                    log.exception('sources-save: 落盘失败')
+
+    def stop_periodic_save(self):
+        self._save_stop.set()
+        if self._save_thread:
+            self._save_thread.join(timeout=2)
 
     def _write_script(self, sid, raw):
         self.scripts_dir.mkdir(parents=True, exist_ok=True)
@@ -276,7 +443,13 @@ class SourceManager:
                     raw = (self.scripts_dir / (sid + '.js')).read_text('utf-8')
                 except Exception:
                     raw = ''
-                entries.append({'id': sid, 'name': h.name, 'raw': raw, 'lastSuccess': h.last_success})
+                entries.append({
+                    'id': sid,
+                    'name': h.name,
+                    'raw': raw,
+                    'lastSuccess': h.last_success,
+                    'score': h.score.to_dict(),
+                })
             content = json.dumps(entries, ensure_ascii=False, indent=2)
             tmp = self.store_file.with_suffix('.json.tmp')
             try:
@@ -296,7 +469,7 @@ class SourceManager:
     def _add(self, raw):
         sid = 'lx_' + uuid.uuid4().hex[:10]
         script_file = self._write_script(sid, raw)
-        h = LxScriptHandle(script_file, self.bridge_path, self.node)
+        h = LxScriptHandle(script_file, self.bridge_path, self.node, on_dirty=self._mark_dirty)
         h.id = sid
         self.handles[sid] = h
         return h
@@ -422,14 +595,32 @@ class SourceManager:
         """支持指定平台的所有音源句柄(自动解析用)"""
         return [h for h in self.handles.values() if platform in h.sources]
 
+    def handles_for_score(self, platform, quality=None):
+        """返回按分数降序的句柄列表. quality=None 时按综合分排."""
+        handles = self.handles_for(platform)
+        return sorted(handles, key=lambda h: -h.score.score(quality))
+
+    def handles_topk(self, platform, quality=None, k=3):
+        """按分数取 top-K 句柄. 至少返回 1 个; 不足则全返."""
+        if k < 1:
+            k = 1
+        return self.handles_for_score(platform, quality)[:k]
+
     def list(self):
         return [{
             'id': sid, 'name': h.name, 'kind': 'lxScript', 'sources': h.sources,
-            'lastSuccess': h.last_success,
+            'lastSuccess': h.last_success, 'score': h.score.to_dict(),
         } for sid, h in self.handles.items()]
 
+    def scores_map(self):
+        """id -> { name, score, lastSuccess } 精简视图, 供前端快速获取."""
+        return {
+            sid: {'name': h.name, 'score': h.score.to_dict(), 'lastSuccess': h.last_success}
+            for sid, h in self.handles.items()
+        }
+
     def close_all(self):
-        pass
+        self.stop_periodic_save()
 
 
 class SubscriptionManager:
@@ -441,7 +632,6 @@ class SubscriptionManager:
         self.store_file = self.data_dir / 'subscriptions.json'
         self.sm = source_manager
         self.groups = []
-        # per-group 锁, 第一次访问时惰性创建
         self._locks = {}
         self._locks_guard = threading.Lock()
 
@@ -459,7 +649,6 @@ class SubscriptionManager:
 
     def _save(self):
         self.data_dir.mkdir(parents=True, exist_ok=True)
-        # 原子写入防半写
         tmp = self.store_file.with_suffix('.json.tmp')
         try:
             with open(tmp, 'w', encoding='utf-8') as f:
@@ -487,7 +676,6 @@ class SubscriptionManager:
         return self.groups
 
     def add(self, name, urls, interval_min=60):
-        # 间隔下限 5 分钟(防滥用), 上限 1 周(防长时间不更新意外)
         try:
             iv = int(interval_min)
         except Exception:
@@ -497,17 +685,16 @@ class SubscriptionManager:
         self.groups.append({
             'id': gid,
             'name': name,
-            'urls': urls,  # [{url, kind: 'js'|'zip'}]
+            'urls': urls,
             'intervalMin': iv,
             'lastUpdate': None,
             'sources': [],
-            'lastErrorCount': 0,  # 最近一次刷新错误数, 前端显示用
+            'lastErrorCount': 0,
         })
         self._save()
         return gid
 
     def remove(self, gid):
-        """持有 per-group 锁, 防止与并发的 update() 互踩产生孤儿 source"""
         with self._lock_for(gid):
             g = next((g for g in self.groups if g['id'] == gid), None)
             if g is None:
@@ -519,19 +706,15 @@ class SubscriptionManager:
                     log.warning('清理订阅组 %s 旧源 %s 失败: %s', gid, sid, ex)
             self.groups = [g for g in self.groups if g['id'] != gid]
             self._save()
-        # 锁已不再需要, 释放引用
         with self._locks_guard:
             self._locks.pop(gid, None)
         return True
 
     def update(self, gid):
-        """持有 per-group 锁, 防止与并发的 update()/remove() 互踩.
-        锁内重新查组, 若已被删除则跳过."""
         with self._lock_for(gid):
             g = next((g for g in self.groups if g['id'] == gid), None)
             if g is None:
                 raise RuntimeError('订阅组不存在')
-            # 清理旧 source
             for sid in (g.get('sources') or []):
                 try:
                     self.sm.remove(sid)
@@ -556,7 +739,6 @@ class SubscriptionManager:
                         new_sids.append(h.id)
                 except Exception as e:
                     errors.append({'url': url, 'kind': kind, 'error': str(e)[:200]})
-            # 二次检查: 若锁内被其他路径删除, 不再写
             if not any(x.get('id') == gid for x in self.groups):
                 log.info('订阅组 %s 在更新过程中被删除, 跳过持久化', gid)
                 return {'added': new_sids, 'errors': errors, 'lastUpdate': int(_time.time() * 1000), 'deleted': True}
@@ -599,14 +781,12 @@ class AutoUpdater:
                     self._run_due(due)
             except Exception:
                 log.exception('auto-updater: 循环异常')
-            # 可中断 sleep
             for _ in range(self.check_interval):
                 if self._stop.is_set():
                     return
                 _time.sleep(1)
 
     def _run_due(self, due):
-        """并行刷新多个到期订阅组, 上限 AUTOUPDATER_PARALLEL"""
         from concurrent.futures import ThreadPoolExecutor, as_completed
         workers = min(len(due), AUTOUPDATER_PARALLEL)
         log.info('auto-updater: %d 个订阅组到期, 并行 %d', len(due), workers)
