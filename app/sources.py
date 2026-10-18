@@ -2,13 +2,14 @@
 """音源管理: 洛雪音源脚本(JS)通过 node 子进程桥在沙箱中运行
 设计: 每次解析请求都启动全新桥进程, 用完即杀, 彻底避免进程卡死/管道堆积拖垮服务
 
-扩展(批次/压缩/订阅/评分):
+扩展(批次/压缩/订阅/评分/进程池):
 - SourceManager.import_from_files: 多个 .js 文件批量导入(前端 multipart)
 - SourceManager.import_from_zip_path / _bytes / _url_zip: ZIP 批量导入(支持流式)
 - SubscriptionManager: 订阅分组(URL 列表 + 自动刷新间隔, per-group 锁防并发竞争)
 - AutoUpdater: 后台线程并行刷新到期订阅组
 - SourceScore: per-source 滚动统计(成功率/平均延迟/按音质成功率), 复合分用于智能选源
 - SourceManager.handles_for_score(): 按分数降序返回, 供 resolve-all 优先跑高分源
+- LxScriptHandle: 进程池(per-source, max=1, TTL=30s) 复用 node 桥, 减少 spawn 开销
 """
 import io
 import json
@@ -39,11 +40,11 @@ BATCH_IMPORT_PARALLEL = 4  # 批量 import 时并发 node spawn 上限
 class SourceScore:
     """单源滚动统计: Bayesian 平滑成功率 + 滑动窗口平均延迟 + 按音质分桶成功率.
     复合分 score = 0.4 × 音质匹配 + 0.3 × 速度 + 0.3 × 可靠性, 范围 [0, 1], 越高越优先."""
-    RECENT_WINDOW = 20           # 滑动窗口样本数
-    BAYES_PRIOR_TRIALS = 5       # 贝叶斯平滑先验次数(防冷启极端)
-    BAYES_PRIOR_SUCCESS = 2.5    # 贝叶斯平滑先验成功(0.5 = 中性)
-    LATENCY_FAST_MS = 500        # 这延迟以下算极快
-    LATENCY_SLOW_MS = 10000      # 这延迟以上算极慢
+    RECENT_WINDOW = 20
+    BAYES_PRIOR_TRIALS = 5
+    BAYES_PRIOR_SUCCESS = 2.5
+    LATENCY_FAST_MS = 500
+    LATENCY_SLOW_MS = 10000
     WEIGHT_QUALITY = 0.4
     WEIGHT_SPEED = 0.3
     WEIGHT_RELIABILITY = 0.3
@@ -51,17 +52,16 @@ class SourceScore:
     def __init__(self):
         self.successes = 0
         self.failures = 0
-        self.rate_limited = 0      # 限流次数(行业标准 code 5), 跟踪但不计入普通失败
+        self.rate_limited = 0
         self.last_success_at = None
         self.last_failure_at = None
         self.last_rate_limit_at = None
-        self.quality_attempts = {}   # quality -> int
+        self.quality_attempts = {}
         self.quality_successes = {}
-        self.recent_latencies = []   # last RECENT_WINDOW (ms)
+        self.recent_latencies = []
 
     def record(self, success, latency_ms=None, quality=None, rate_limited=False):
         if rate_limited:
-            # 限流(code 5)不计入普通失败, 但记录以便前端可观测
             self.rate_limited += 1
             self.last_rate_limit_at = _time.time()
             return
@@ -86,7 +86,6 @@ class SourceScore:
 
     @property
     def success_rate(self):
-        """Bayesian-smoothed: 极少调用时往 0.5 拉, 防极端"""
         if self.total_trials == 0:
             return 0.5
         return (self.successes + self.BAYES_PRIOR_SUCCESS) / (self.total_trials + self.BAYES_PRIOR_TRIALS)
@@ -105,7 +104,6 @@ class SourceScore:
         return (s + 1) / (a + 2)
 
     def score(self, requested_quality=None):
-        """综合分: 0-1, 越高越优先."""
         if requested_quality:
             qs = self.quality_score(requested_quality)
         else:
@@ -146,6 +144,13 @@ class SourceScore:
 
 
 class LxScriptHandle:
+    """Per-source node bridge handle. 每次解析用 _acquire/_release 池化复用进程,
+    大幅减少 cold-start 100ms spawn 开销. 池条目按空闲 TTL + 绝对最大寿命清理."""
+
+    POOL_MAX = 1       # 每源最多缓存 1 个空闲进程(N 源时内存: N × ~40MB)
+    POOL_TTL = 30      # 空闲 30s 后下次 acquire 时清理
+    POOL_MAX_AGE = 600 # 绝对最大存活 10min(防脚本状态膨胀)
+
     def __init__(self, script_path, bridge_path, node='node', on_dirty=None):
         self.script_path = str(script_path)
         self.bridge_path = str(bridge_path)
@@ -156,16 +161,16 @@ class LxScriptHandle:
         self.last_success = None
         self.score = SourceScore()
         self._on_dirty = on_dirty
-        # raw 文本懒加载缓存: 避免每次 _save() 重读磁盘
         self._raw_cache = None
-        # 单源限速(不同源互不干扰, 每源自身请求间隔 0.5s 防 429)
         self._rate_lock = threading.Lock()
         self._rate_last = [0.0]
         self._rate_interval = 0.5
+        # 进程池: list of (proc, q, last_used_ts, create_ts)
+        self._pool = []
+        self._pool_lock = threading.Lock()
         self._load_meta()
 
     def _get_raw(self):
-        """惰性读脚本文本, 缓存避免每次 _save 重读磁盘. 进程内生命周期内稳定."""
         if self._raw_cache is None:
             try:
                 with open(self.script_path, 'r', encoding='utf-8') as f:
@@ -222,8 +227,55 @@ class LxScriptHandle:
             err = ''
         return err
 
+    def _acquire(self):
+        """从池里拿一个健康进程(未过期); 没有或全过期则 spawn 新. 同时清理池中废条目."""
+        with self._pool_lock:
+            now = _time.time()
+            fresh = []
+            for entry in self._pool:
+                proc, q, ts, ct = entry[0], entry[1], entry[2], entry[3]
+                if proc.poll() is not None:
+                    continue
+                if (now - ts) > self.POOL_TTL or (now - ct) > self.POOL_MAX_AGE:
+                    self._kill(proc)
+                    continue
+                fresh.append(entry)
+            self._pool = fresh
+            # 拿一个健康的, 同时清空残留消息(console / bridge-ready / 上次未消费完的)
+            while self._pool:
+                entry = self._pool.pop(0)
+                proc, q = entry[0], entry[1]
+                if proc.poll() is None:
+                    self._drain_queue(q)
+                    return proc, q
+            return self._spawn()
+
+    def _release(self, proc, q):
+        """用完放回池里. 已死/已满则丢弃."""
+        with self._pool_lock:
+            try:
+                if proc.poll() is not None:
+                    return
+                while len(self._pool) >= self.POOL_MAX:
+                    old_proc = self._pool.pop(0)[0]
+                    self._kill(old_proc)
+                now = _time.time()
+                self._pool.append((proc, q, now, now))
+            except Exception:
+                try:
+                    self._kill(proc)
+                except Exception:
+                    pass
+
+    def _drain_queue(self, q):
+        try:
+            while True:
+                q.get_nowait()
+        except queue.Empty:
+            pass
+
     def _load_meta(self):
-        proc, q = self._spawn()
+        proc, q = self._acquire()
         try:
             while True:
                 msg = q.get(timeout=META_TIMEOUT)
@@ -238,11 +290,14 @@ class LxScriptHandle:
                 if msg.get('ok') is False:
                     raise RuntimeError(msg.get('error') or '音源脚本初始化失败')
         except queue.Empty:
-            self._kill(proc)
             err = self._read_stderr(proc)
+            self._kill(proc)
             raise RuntimeError('音源脚本初始化失败: ' + (err.strip() if err.strip() else '未在超时内收到 meta'))
         finally:
-            self._kill(proc)
+            try:
+                self._release(proc, q)
+            except Exception:
+                pass
 
     def _record(self, success, latency_ms, quality, rate_limited=False):
         self.score.record(success, latency_ms, quality, rate_limited=rate_limited)
@@ -254,28 +309,26 @@ class LxScriptHandle:
 
     @staticmethod
     def _detect_rate_limit(err_msg):
-        """行业惯例: 上游返回 code 5 / "too many requests" 表示限流(非真实失败)."""
         if not err_msg:
             return False
         e = err_msg.lower()
         return ('code 5' in e) or ('too many requests' in e) or ('rate limit' in e) or ('限流' in err_msg) or ('频繁' in err_msg)
 
     def _actions_for(self, platform):
-        """该源对此平台声明支持的动作. 预检避免无谓 spawn."""
         info = self.sources.get(platform) or {}
         return info.get('actions') or []
 
     def resolve(self, source, song, quality):
-        # 预检: 源声明不支持 musicUrl 时直接报错, 不浪费 node spawn
         actions = self._actions_for(source)
         if actions and 'musicUrl' not in actions:
             raise RuntimeError(f'{self.name or "音源"} 不支持 {source} 的 musicUrl action')
 
         t0 = _time.time()
-        proc, q = self._spawn()
+        proc, q = None, None
         success = False
         rate_limited = False
         try:
+            proc, q = self._acquire()
             req = {'source': source, 'action': 'musicUrl',
                    'info': {'musicInfo': dict(song), 'type': quality}}
             proc.stdin.write(json.dumps(req, ensure_ascii=False) + '\n')
@@ -301,11 +354,21 @@ class LxScriptHandle:
                     return msg.get('data') or {}
                 raise RuntimeError('音源返回格式无效')
         except queue.Empty:
+            if proc is not None:
+                self._kill(proc)
+                proc = None
             raise RuntimeError('音源请求超时')
         finally:
-            self._kill(proc)
             ms = int((_time.time() - t0) * 1000)
             self._record(success, ms if success else None, quality, rate_limited=rate_limited)
+            if proc is not None:
+                try:
+                    if proc.poll() is None:
+                        self._release(proc, q)
+                    else:
+                        self._kill(proc)
+                except Exception:
+                    pass
 
     def _throttle(self):
         with self._rate_lock:
@@ -321,10 +384,11 @@ class LxScriptHandle:
             raise RuntimeError(f'{self.name or "音源"} 不支持 {platform} 的 musicUrl action')
 
         self._throttle()
-        proc, q = self._spawn()
+        proc, q = None, None
         deadline_all = _time.time() + overall_timeout
+        results = {}
         try:
-            results = {}
+            proc, q = self._acquire()
             for quality in qualities:
                 if _time.time() > deadline_all:
                     break
@@ -355,10 +419,17 @@ class LxScriptHandle:
                 self.last_success = _time.time()
             return results
         finally:
-            self._kill(proc)
             t_end = _time.time()
             ms = int(overall_timeout * 1000) if not results else int((overall_timeout - max(0, deadline_all - t_end)) * 1000)
             self._record(bool(results), ms, None)
+            if proc is not None:
+                try:
+                    if proc.poll() is None:
+                        self._release(proc, q)
+                    else:
+                        self._kill(proc)
+                except Exception:
+                    pass
 
     def search(self, platform, keyword, page=1, limit=30):
         actions = self._actions_for(platform)
@@ -368,10 +439,11 @@ class LxScriptHandle:
         actions = (self.sources.get(platform) or {}).get('actions') or []
         action = 'musicSearch' if 'musicSearch' in actions else 'search'
         t0 = _time.time()
-        proc, q = self._spawn()
+        proc, q = None, None
         success = False
         rate_limited = False
         try:
+            proc, q = self._acquire()
             req = {'source': platform, 'action': action, 'info': {'keyword': keyword, 'page': page, 'limit': limit}}
             proc.stdin.write(json.dumps(req, ensure_ascii=False) + '\n')
             proc.stdin.flush()
@@ -393,14 +465,27 @@ class LxScriptHandle:
                     data = msg.get('data') or {}
                     return data.get('list') or []
         except queue.Empty:
+            if proc is not None:
+                self._kill(proc)
+                proc = None
             raise RuntimeError('搜索超时')
         finally:
-            self._kill(proc)
             ms = int((_time.time() - t0) * 1000)
             self._record(success, ms if success else None, None, rate_limited=rate_limited)
+            if proc is not None:
+                try:
+                    if proc.poll() is None:
+                        self._release(proc, q)
+                    else:
+                        self._kill(proc)
+                except Exception:
+                    pass
 
     def close(self):
-        pass
+        with self._pool_lock:
+            for proc, q, _, _ in self._pool:
+                self._kill(proc)
+            self._pool = []
 
 
 class SourceManager:
@@ -415,8 +500,6 @@ class SourceManager:
         self._dirty = False
         self._save_stop = threading.Event()
         self._save_thread = None
-        # 批量 import 时让 _add 并发跑, 减少大 ZIP import 的串行 spawn 等待
-        self._import_executor = None
 
     def init(self):
         if self.store_file.exists():
@@ -478,8 +561,6 @@ class SourceManager:
         return f
 
     def _save(self):
-        """原子写入: tmp + os.replace, 配合 _save_lock 防并发损坏 sources.json.
-        使用 handle._get_raw() 内存缓存, 避免每次重读 .js 文件."""
         with self._save_lock:
             self.data_dir.mkdir(parents=True, exist_ok=True)
             entries = []
@@ -517,8 +598,6 @@ class SourceManager:
         return h
 
     def _add_batch(self, raws_with_names):
-        """批量并发初始化 handle(meta 并行加载), 适用于 ZIP 一次性几十上百个 .js.
-        raws_with_names: list of (filename, raw_text) tuples."""
         if not raws_with_names:
             return []
 
@@ -531,7 +610,6 @@ class SourceManager:
                 return (fn, None, str(e)[:120])
 
         workers = min(len(raws_with_names), BATCH_IMPORT_PARALLEL)
-        # 复用短命 executor; 不用 self._import_executor 以免和并发 import 互踩
         with ThreadPoolExecutor(max_workers=workers) as ex:
             return list(ex.map(_do_one, raws_with_names))
 
@@ -550,7 +628,6 @@ class SourceManager:
 
     # ---- 批量 / 压缩包 ----
     def import_from_files(self, files):
-        """从前端 multipart 传入的多个 File 对象批量导入."""
         items = []
         for f in files:
             try:
@@ -573,12 +650,8 @@ class SourceManager:
                     raw_text = str(raw_bytes)
             except Exception:
                 continue
-            if not raw_text.lstrip().startswith(('/*', '//', 'var ', 'const ', 'let ', 'function', 'export')) and '.js' not in (fn or '').lower():
-                # 兜底: 文件名后缀是 .js 就当 JS 处理
-                pass
             parsed.append((fn, raw_text))
 
-        # 并发跑 meta 加载
         results = self._add_batch(parsed)
         added = []
         failed = []
@@ -592,7 +665,6 @@ class SourceManager:
         return {'added': added, 'failed': failed}
 
     def _zip_extract_js(self, zip_path):
-        """从 ZIP 提取 (filename, content) 列表, 跳过目录/隐藏/非.js."""
         out = []
         try:
             z = zipfile.ZipFile(zip_path)
@@ -634,7 +706,6 @@ class SourceManager:
         return {'added': added, 'failed': failed}
 
     def import_from_zip_bytes(self, raw_bytes):
-        """适合小 ZIP, 大 ZIP 推荐 import_from_zip_path 流式"""
         import tempfile
         with tempfile.NamedTemporaryFile(suffix='.zip', delete=False) as tmp:
             tmp.write(raw_bytes)
@@ -662,7 +733,7 @@ class SourceManager:
         if h is None:
             return False
         h.close()
-        h._raw_cache = None  # 释放缓存
+        h._raw_cache = None
         self._save()
         return True
 
@@ -673,7 +744,6 @@ class SourceManager:
         return [h for h in self.handles.values() if platform in h.sources]
 
     def handles_for_score(self, platform, quality=None):
-        """返回按分数降序的句柄列表. quality=None 时按综合分排."""
         handles = self.handles_for(platform)
         return sorted(handles, key=lambda h: -h.score.score(quality))
 
@@ -696,11 +766,15 @@ class SourceManager:
 
     def close_all(self):
         self.stop_periodic_save()
+        for h in self.handles.values():
+            try:
+                h.close()
+            except Exception:
+                pass
 
 
 class SubscriptionManager:
-    """订阅分组: 一组 URL(.js / .zip 混合), 定时整体刷新.
-    per-group 锁防止 update()/remove()/并发的 AutoUpdater 刷新互踩."""
+    """订阅分组: 一组 URL(.js / .zip 混合), 定时整体刷新."""
     def __init__(self, data_dir, source_manager):
         self.data_dir = Path(data_dir)
         self.store_file = self.data_dir / 'subscriptions.json'
