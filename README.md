@@ -23,6 +23,8 @@ app/             Python后端(FastAPI)
   queue.py       并发任务队列
   bridge.mjs     洛雪音源脚本运行桥(node 子进程 + vm 沙箱)
 web/static/      前端(原生 HTML/JS/CSS, 无构建)
+docker-compose.yml       本地源码构建(开发用, build: .)
+docker-compose.ghcr.yml  直接拉 GHCR 镜像(部署用, 推荐)
 .github/workflows/
   docker.yml     CI: 构建并推送 Docker 镜像到 GHCR
   release.yml    CI: 打包源码 zip + tar.gz 并创建 GitHub Release
@@ -30,20 +32,43 @@ web/static/      前端(原生 HTML/JS/CSS, 无构建)
 
 ## 部署 & 持续集成
 
-### 本地运行
+### 方式 A: 直接拉 GHCR 镜像(推荐)
 
-使用 docker-compose:
+无需克隆源码, 一行拉起服务:
 
 ```bash
-docker compose up -d
+curl -fLO https://raw.githubusercontent.com/obrige/music-archiver/main/docker-compose.ghcr.yml
+docker compose -f docker-compose.ghcr.yml up -d
 ```
 
-或手动运行:
+特性:
+
+- 直接拉 `ghcr.io/obrige/music-archiver:latest` (多架构 amd64/arm64)
+- `pull_policy: always` 每次启动都拉最新
+- 内置 `healthcheck` 监控端口存活
+- `./data` 持久化音源/任务/曲库
+- 监听 `5245`, 自动重启
+
+要固定版本避免 `latest` 漂移, 编辑 `docker-compose.ghcr.yml` 里的 `image`:
+
+```yaml
+image: ghcr.io/obrige/music-archiver:1.0.0   # 或 :sha-<commit>
+```
+
+### 方式 B: 本地源码构建(开发用)
+
+```bash
+git clone https://github.com/obrige/music-archiver
+cd music-archiver
+docker compose up -d                  # docker-compose.yml: build: .
+```
+
+或纯 Python 跑(适合调试):
 
 ```bash
 pip install -r requirements.txt
-node bridge.mjs &      # 音源桥
-uvicorn app.main:app --host 0.0.0.0 --port 8000
+node bridge.mjs &                     # 音源桥
+uvicorn app.main:app --host 0.0.0.0 --port 5245
 ```
 
 ### Docker 镜像 (GHCR)
@@ -58,13 +83,6 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | 手动 `workflow_dispatch` | 默认 `latest` |
 
 启用 GHA 缓存 (`type=gha`) 加速重复构建。
-
-```bash
-docker pull ghcr.io/obrige/music-archiver:latest
-docker run -d --name music-archiver -p 8000:8000 \
-  -v $(pwd)/data:/app/data \
-  ghcr.io/obrige/music-archiver:latest
-```
 
 ### Release 源码包
 
