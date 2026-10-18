@@ -3,7 +3,7 @@
 
 扩展:
 - /api/sources/import-files: 批量上传 .js 文件(多选/文件夹)
-- /api/sources/import-zip:  上传 ZIP 批量导入
+- /api/sources/import-zip:  上传 ZIP 批量导入(流式 + 大小限制, 防 OOM/DoS)
 - /api/sources/import-zip-url: 下载 URL 指向的 ZIP 批量导入
 - /api/subscriptions: 订阅分组 CRUD
 - /api/subscriptions/{gid}/refresh: 手动触发刷新
@@ -581,25 +581,60 @@ async def import_files(request: Request):
 
 @router.post('/api/sources/import-zip')
 async def import_zip(request: Request):
-    """上传 ZIP 批量导入. 表单字段: file (multipart, 单个 .zip)"""
+    """上传 ZIP 批量导入. **流式**到磁盘 + 大小限制, 避免 OOM 与 DoS.
+    MAX_ZIP_UPLOAD_MB 环境变量可调上限(默认 200MB)."""
+    import os
+    import tempfile
+    try:
+        max_mb = int(os.environ.get('MAX_ZIP_UPLOAD_MB', '200'))
+    except Exception:
+        max_mb = 200
+    max_bytes = max_mb * 1024 * 1024
     try:
         form = await request.form()
         f = form.get('file')
         if not f:
             raise HTTPException(400, '未提供 ZIP 文件')
-        raw = await f.read()
-        if not raw:
-            raise HTTPException(400, 'ZIP 文件为空')
-        return request.app.state.sm.import_from_zip_bytes(raw)
+        # 流式写临时文件, 超限立即中止并返回 413
+        size = 0
+        tmp = tempfile.NamedTemporaryFile(suffix='.zip', delete=False)
+        try:
+            while True:
+                chunk = await f.read(64 * 1024)
+                if not chunk:
+                    break
+                size += len(chunk)
+                if size > max_bytes:
+                    tmp.close()
+                    try:
+                        os.unlink(tmp.name)
+                    except Exception:
+                        pass
+                    raise HTTPException(413, 'ZIP 文件过大 (上限 %dMB)' % max_mb)
+                tmp.write(chunk)
+            tmp_path = tmp.name
+        finally:
+            try:
+                tmp.close()
+            except Exception:
+                pass
+        try:
+            return request.app.state.sm.import_from_zip_path(tmp_path)
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(400, 'ZIP 解压失败: ' + str(e))
+        raise HTTPException(400, 'ZIP 处理失败: ' + str(e))
 
 
 @router.post('/api/sources/import-zip-url')
 def import_zip_url(body: dict, request: Request):
-    """下载 URL 指向的 ZIP 后批量导入. body: { url }"""
+    """下载 URL 指向的 ZIP 后批量导入. body: { url }
+    URL 下载有 60s 超时(由 SourceManager.import_from_url_zip 控制)."""
     url = str((body or {}).get('url') or '').strip()
     if not re.match(r'^https?://', url):
         raise HTTPException(400, 'url 必须为 http(s) 链接')
@@ -670,7 +705,7 @@ def remove_sub(gid: str, request: Request):
 
 @router.post('/api/subscriptions/{gid}/refresh')
 def refresh_sub(gid: str, request: Request):
-    """手动触发刷新该组"""
+    """手动触发刷新该组. update() 内置 per-group 锁, 并发触发不会竞态"""
     try:
         return request.app.state.subm.update(gid)
     except Exception as e:
