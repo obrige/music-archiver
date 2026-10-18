@@ -12,14 +12,13 @@ ENV PIP_INDEX_URL=$PIP_INDEX_URL PIP_DISABLE_PIP_VERSION_CHECK=1
 COPY requirements.txt ./
 # 三级源回退: 阿里云 -> 清华 -> 官方 PyPI, 任一成功即继续; 装完自检可导入
 RUN pip install --no-cache-dir --timeout 60 --retries 3 -r requirements.txt \
- || pip install --no-cache-dir --timeout 60 --retries 3 -i https://pypi.tuna.tsinghua.edu.cn/simple -r requirements.txt \
- || pip install --no-cache-dir --timeout 60 --retries 3 -i https://pypi.org/simple/ -r requirements.txt \
- && python -c "import fastapi, uvicorn; print('deps ok')"
+  || pip install --no-cache-dir --timeout 60 --retries 3 -i https://pypi.tuna.tsinghua.edu.cn/simple -r requirements.txt \
+  || pip install --no-cache-dir --timeout 60 --retries 3 -i https://pypi.org/simple/ -r requirements.txt \
+  && python -c "import fastapi, uvicorn; print('deps ok')"
 
 COPY app/ ./app/
 COPY bridge.mjs ./
 COPY crypto-js.js ./
-COPY node_modules/ ./node_modules/
 COPY web/static/ ./web/static/
 
 ENV PORT=5245 DATA_DIR=/data CONCURRENCY=3
