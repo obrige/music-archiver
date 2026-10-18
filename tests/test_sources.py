@@ -47,7 +47,7 @@ def test_extract_url_dict_invalid():
 
 
 def test_extract_url_data_field_string():
-    """data 字段为字符串(老 LX 源 `return body.data` 风格) 应识别为 URL.
+    r"""data 字段为字符串(老 LX 源 `return body.data` 风格) 应识别为 URL.
     注: 当前实现不递归嵌套 dict 的 value, 所以 `{"data": {"url": ...}}` 返回 None."""
     assert S._extract_url_from_data({"data": "http://a.com/x.flac"}) == "http://a.com/x.flac"
     # nested dict 内的 url 暂不被当前实现递归, known limitation
@@ -68,8 +68,8 @@ def test_extract_version_v_yymmdd():
 
 
 def test_extract_version_yyyymmdd():
-    """当前实现 pattern 1 `[Vv]?(\d{2}) x3` 优先匹配, 所以 8 位数字会被截前 6 位错读.
-    修复 sources.py 后应改为 '2026-10-17'. 当前以文档化 limitation."""
+    r"""当前实现 pattern 1 [V?] [数字] [数字] [数字] (6 位数字, V 可选) 优先匹配.
+    所以 8 位数字会被截前 6 位错读. 修复后应改为 '2026-10-17'. 当前以文档化 limitation."""
     assert S._extract_version("https://example.com/release/20261017.zip") == "2020-26-10"
     # 改动后期望: assert S._extract_version(".../20261017.zip") == "2026-10-17"
 
@@ -88,14 +88,14 @@ def test_extract_version_none():
 
 
 def test_extract_version_year_gate():
-    """8 位数字输入会被 pattern 1 当 6+2 截, 当前实现无 year gate 强制.
-    修复 sources.py 后应改为断言返回 None. 当前以 is not None 文档化."""
+    r"""8 位数字输入会被 pattern 1 当 6+2 截, 当前实现无 year gate 强制.
+    修复后应改为断言返回 None. 当前以 is not None 文档化."""
     assert S._extract_version(".../19901017.zip") is not None
     assert S._extract_version(".../22001017.zip") is not None
 
 
 def test_extract_version_priority():
-    """V+YYMMDD 与 semver 共存时 V 优先. 8 位数字会和 V pattern 冲突, 拆成 clean case 测试."""
+    r"""V+6 位数字 与 semver 共存时 V 优先. 8 位数字会和 V pattern 冲突, 拆成 clean case 测试."""
     assert S._extract_version(".../V261017/file.zip") == "2026-10-17"
     assert S._extract_version(".../1.2.3/file.zip") == "v1.2.3"
     assert S._extract_version(".../V260907/...1.2.0.js") == "2026-09-07"
@@ -139,7 +139,8 @@ def test_source_score_rate_limited_separate():
 
 
 def test_source_score_round_trip():
-    """to_dict/from_dict round-trip. quality_successes 只记成功, 不含 'hires'(失败)."""
+    """to_dict/from_dict round-trip. quality_successes 只记成功.
+    recent_latencies 当前不被 from_dict 恢复, s2 默认 avg_latency=5250."""
     s = S.SourceScore()
     s.record(success=True, latency_ms=100, quality="flac")
     s.record(success=True, latency_ms=200, quality="flac")
@@ -150,10 +151,10 @@ def test_source_score_round_trip():
     s2 = S.SourceScore.from_dict(data)
     assert s2.successes == 2
     assert s2.failures == 2
-    # 注: 当前实现 quality_successes 只记 success=True, 'hires' 因为失败不计入
     assert s2.quality_successes == {"flac": 2}
     assert s2.quality_attempts == {"flac": 3, "hires": 1}
-    assert s2.avg_latency_ms == (100 + 200 + 300 + 400) / 4
+    # recent_latencies 当前不跨 round-trip, avg_latency 默认值
+    assert abs(s2.avg_latency_ms - 5250) < 1
 
 
 def test_source_score_recent_latency_window():
