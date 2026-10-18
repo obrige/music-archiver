@@ -110,7 +110,11 @@
       <div class="section-title">音源管理（洛雪音源脚本）</div>
       <div class="card">
         <div class="row"><input id="import-url" placeholder="https://… 洛雪音源脚本地址" /><button id="btn-import-url" class="primary">URL 导入</button></div>
-        <div class="row"><input type="file" id="import-file" accept=".js" style="flex:1" /><span class="hint">本地 .js 导入</span></div>
+        <div class="row"><input type="file" id="import-file" accept=".js" style="flex:1" /><span class="hint">本地 .js</span></div>
+        <div class="row"><input type="file" id="import-folder" webkitdirectory directory multiple accept=".js" style="flex:1" /><span class="hint">文件夹批量(含子目录)</span></div>
+        <div class="row"><input type="file" id="import-multi" multiple accept=".js" style="flex:1" /><span class="hint">多选 .js 文件</span></div>
+        <div class="row"><input type="file" id="import-zip" accept=".zip" style="flex:1" /><span class="hint">ZIP 压缩包</span></div>
+        <div class="row"><input id="import-zip-url" placeholder="https://… 指向 .zip 的链接" /><button id="btn-import-zip-url" class="primary">ZIP URL 导入</button></div>
         <div class="table-wrap">
           <table>
             <thead><tr><th>名称</th><th>平台</th><th>音质</th><th>最近成功</th><th style="width:90px">操作</th></tr></thead>
@@ -118,7 +122,42 @@
           </table>
           <div id="source-empty" class="empty" style="display:none">
             <div class="em">🧩</div>
-            <div>还没有音源，导入一个洛雪音源脚本（URL 或本地 .js）</div>
+            <div>还没有音源，从 URL / 本地 .js / 文件夹 / ZIP 任选一种导入</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="section-title">订阅分组（自动定时刷新）</div>
+      <div class="card">
+        <div class="row">
+          <input id="sub-name" placeholder="订阅组名称" style="max-width:240px" />
+          <input id="sub-interval" type="number" value="60" min="5" style="max-width:90px" title="刷新间隔(分钟, 最低 5)" />
+          <span class="hint">分</span>
+          <button id="btn-add-sub" class="primary">创建</button>
+        </div>
+        <div id="sub-editor" style="display:none">
+          <div class="row" style="background:#f8fafc;padding:6px 8px;border-radius:6px;margin-bottom:4px">
+            <span class="hint" id="sub-editor-title" style="font-weight:bold;flex:1"></span>
+            <button id="btn-sub-cancel">取消</button>
+          </div>
+          <div class="row">
+            <select id="sub-url-kind" style="max-width:90px">
+              <option value="js">.js</option>
+              <option value="zip">.zip</option>
+            </select>
+            <input id="sub-url" placeholder="URL" style="flex:1" />
+            <button id="btn-sub-add-url">加入</button>
+          </div>
+          <div id="sub-urls" style="padding:4px 8px;font-size:13px"></div>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>名称</th><th>URL 数</th><th>间隔</th><th>最后更新</th><th style="width:200px">操作</th></tr></thead>
+            <tbody id="sub-tbody"></tbody>
+          </table>
+          <div id="sub-empty" class="empty" style="display:none">
+            <div class="em">📑</div>
+            <div>暂无订阅组。上面创建时填一个名称就行(URL 可后加), 创建后按间隔自动定时刷新</div>
           </div>
         </div>
       </div>
