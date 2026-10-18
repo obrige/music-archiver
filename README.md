@@ -50,7 +50,7 @@ docker compose -f docker-compose.ghcr.yml up -d
 要**固定版本**避免 `latest` 漂移，编辑 compose 的 `image:` 字段：
 
 ```yaml
-image: ghcr.io/obrige/music-archiver:1.0.0   # 或 :sha-<commit>
+image: ghcr.io/obrige/music-archiver:X.Y.Z   # 或 :sha-<commit>
 ```
 
 所有 tag 见 [Packages 页](https://github.com/obrige/music-archiver/pkgs/container/music-archiver)。
@@ -190,19 +190,19 @@ docker-compose.ghcr.yml  直接拉 GHCR 镜像 (推荐)
 | 触发 | 行为 |
 |---|---|
 | push `main` | 构建并推 GHCR，tag `latest` + `main` + `sha-<long>` |
-| push tag `v*` | 同上 + tag `<version>` 系列；自动打包并上传 Release 源码包 |
+| push tag `v*` | 同上 + tag `X.Y.Z` 系列；自动打包并上传 Release 源码包 |
 | pull request | 仅构建，不推送（tag `pr-<n>`） |
 | 手动 `workflow_dispatch` | 手动触发 |
 
 **发版：**
 
 ```bash
-git tag v1.0.0
-git push origin v1.0.0
-# → https://github.com/obrige/music-archiver/releases/tag/v1.0.0
+git tag vX.Y.Z
+git push origin vX.Y.Z
+# → https://github.com/obrige/music-archiver/releases/tag/vX.Y.Z
 ```
 
-带 `-` 的 tag（如 `v1.0.0-rc1`）自动标记为 prerelease。
+带 `-` 的 tag（如 `vX.Y.Z-rc1`）自动标记为 prerelease。
 
 ---
 
