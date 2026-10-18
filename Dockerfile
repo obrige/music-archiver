@@ -1,9 +1,12 @@
 # ===== MusicArchiver (Python 后端 + 洛雪音源沙箱) =====
-# 洛雪音源脚本(JS)通过 node 子进程 + vm 沙箱运行; 仅需 node 二进制(apk 安装, 无 npm)
-FROM python:3.12-alpine
+# 洛雪音源脚本(JS)通过 node 子进程 + vm 沙箱运行; 仅需 node 二进制(apt 安装, 无 npm)
+FROM python:3.14-slim-bookworm
 WORKDIR /app
 
-RUN apk add --no-cache nodejs
+# slim-bookworm 自带 python + pip, 只需装 nodejs; Debian Bookworm 自带 node 18 LTS
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends nodejs ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
 
 # pip 国内镜像(默认阿里云, 构建失败可 --build-arg PIP_INDEX_URL=... 覆盖)
 ARG PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/
