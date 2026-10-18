@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""音源管理: 洛雪音源脚本(JS)通过 node 子进程桥在沙箱中运行
+"""音源管理: 洛雪音源脚本(JS)通过 node 进程桥在沙箱中运行
 设计: 每次解析请求都启动全新桥进程, 用完即杀, 彻底避免进程卡死/管道堆积拖垮服务
 
 扩展(批次/压缩/订阅/评分/进程池):
@@ -31,17 +31,13 @@ log = logging.getLogger('musicarchiver.sources')
 BRIDGE_TIMEOUT = 35
 META_TIMEOUT = 15
 SUB_INTERVAL_MIN = 5
-SUB_INTERVAL_MAX = 10080  # 1 周
+SUB_INTERVAL_MAX = 10080
 SUB_UPDATE_TIMEOUT = 300
 AUTOUPDATER_PARALLEL = 3
 SCORE_SAVE_INTERVAL = 30
 BATCH_IMPORT_PARALLEL = 4
 STRICT_ACTION_CHECK = True
 
-# 版本号提取: 按匹配优先级 (适用于 GitHub release / 自建 URL 等常见命名规律)
-#   1. [Vv]?(\d{2})(\d{2})(\d{2})           e.g. V261017, v260907 → '2026-10-17'
-#   2. (\d{4})(\d{2})(\d{2})                e.g. 20261017        → '2026-10-17'
-#   3. [Vv]?(\d+)\.(\d+)\.(\d+)              e.g. v1.2.3          → 'v1.2.3'
 _VERSION_PATTERNS = [
     (re.compile(r'[Vv]?(\d{2})(\d{2})(\d{2})'), lambda m: f'20{m.group(1)}-{m.group(2)}-{m.group(3)}'),
     (re.compile(r'(\d{4})(\d{2})(\d{2})'), lambda m: f'{m.group(1)}-{m.group(2)}-{m.group(3)}' if 2020 <= int(m.group(1)) <= 2099 else None),
@@ -50,7 +46,6 @@ _VERSION_PATTERNS = [
 
 
 def _extract_version(text):
-    """从 URL/redirect 目标提取版本字符串. 适配常见命名规律(优先级 V+YYMMDD > YYYYMMDD > semver)."""
     if not text:
         return None
     for rx, fmt in _VERSION_PATTERNS:
@@ -63,6 +58,32 @@ def _extract_version(text):
                 return v
         except Exception:
             continue
+    return None
+
+
+def _extract_url_from_data(raw):
+    """从脚本返回的 data 字段提取 URL. 兼容:
+    - str: 直接返回(老 LX Music 风格, 如 huibq `return body.url`)
+    - dict: 优先 .url, 兼容 .src / .data
+    - list: 递归首个
+    - 其他: None"""
+    if raw is None:
+        return None
+    if isinstance(raw, str):
+        if raw.startswith(('http://', 'https://')):
+            return raw
+        return None
+    if isinstance(raw, dict):
+        for key in ('url', 'src', 'data', 'location'):
+            v = raw.get(key)
+            if isinstance(v, str) and v.startswith(('http://', 'https://')):
+                return v
+        return None
+    if isinstance(raw, (list, tuple)) and raw:
+        for item in raw:
+            u = _extract_url_from_data(item)
+            if u:
+                return u
     return None
 
 
@@ -396,7 +417,7 @@ class LxScriptHandle:
                 if msg.get('ok'):
                     success = True
                     self.last_success = _time.time()
-                    return msg.get('data') or {}
+                    return msg.get('data')
                 raise RuntimeError('音源返回格式无效')
         except queue.Empty:
             if proc is not None:
@@ -458,7 +479,9 @@ class LxScriptHandle:
                         log.debug('%s: quality %s 失败: %s', self.name, quality, msg.get('error'))
                         break
                     if msg.get('ok'):
-                        results[quality] = (msg.get('data') or {}).get('url')
+                        url = _extract_url_from_data(msg.get('data'))
+                        if url:
+                            results[quality] = url
                         break
             if results:
                 self.last_success = _time.time()
@@ -837,7 +860,7 @@ class SubscriptionManager:
         self.store_file = self.data_dir / 'subscriptions.json'
         self.sm = source_manager
         self.groups = []
-        self.last_versions = {}  # gid -> { url: 'YYYY-MM-DD' }
+        self.last_versions = {}
         self._locks = {}
         self._locks_guard = threading.Lock()
 
