@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
-"""sources.py 测试. CI 在 .github/workflows/test.yml 跑.
-注: 适配当前 sources.py 实现, 含 known limitation 注释. 修 sources.py 后可重新启用严格断言."""
+"""sources.py 严格单元测试. CI 在 .github/workflows/test.yml 跑.
+要求 sources.py 实际行为符合测试断言; bug 已修."""
 import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -47,11 +47,13 @@ def test_extract_url_dict_invalid():
 
 
 def test_extract_url_data_field_string():
-    r"""data 字段为字符串(老 LX 源 `return body.data` 风格) 应识别为 URL.
-    注: 当前实现不递归嵌套 dict 的 value, 所以 `{"data": {"url": ...}}` 返回 None."""
     assert S._extract_url_from_data({"data": "http://a.com/x.flac"}) == "http://a.com/x.flac"
-    # nested dict 内的 url 暂不被当前实现递归, known limitation
-    assert S._extract_url_from_data({"data": {"url": "http://a.com/x.flac"}}) is None
+
+
+def test_extract_url_nested_dict_recursive():
+    """修复: data 字段为 dict 时递归提取. 例如 MusicDownloader 风格 {{"data": {{"url": "..."}}}}"""
+    assert S._extract_url_from_data({"data": {"url": "http://a.com/x.flac"}}) == "http://a.com/x.flac"
+    assert S._extract_url_from_data({"src": {"src": "http://deep.com/x"}}) == "http://deep.com/x"
 
 
 def test_extract_url_from_list():
@@ -68,10 +70,9 @@ def test_extract_version_v_yymmdd():
 
 
 def test_extract_version_yyyymmdd():
-    r"""当前实现 pattern 1 [V?] [数字] [数字] [数字] (6 位数字, V 可选) 优先匹配.
-    所以 8 位数字会被截前 6 位错读. 修复后应改为 '2026-10-17'. 当前以文档化 limitation."""
-    assert S._extract_version("https://example.com/release/20261017.zip") == "2020-26-10"
-    # 改动后期望: assert S._extract_version(".../20261017.zip") == "2026-10-17"
+    """修复: 8 位 YYYYMMDD 应正确解析, 不被 6 位 pattern 误读."""
+    assert S._extract_version("https://example.com/release/20261017.zip") == "2026-10-17"
+    assert S._extract_version(".../20251225.zip") == "2025-12-25"
 
 
 def test_extract_version_semver():
@@ -88,17 +89,17 @@ def test_extract_version_none():
 
 
 def test_extract_version_year_gate():
-    r"""8 位数字输入会被 pattern 1 当 6+2 截, 当前实现无 year gate 强制.
-    修复后应改为断言返回 None. 当前以 is not None 文档化."""
-    assert S._extract_version(".../19901017.zip") is not None
-    assert S._extract_version(".../22001017.zip") is not None
+    """修复: 异常年份应被拒绝返回 None."""
+    assert S._extract_version(".../19901017.zip") is None
+    assert S._extract_version(".../22001017.zip") is None
 
 
 def test_extract_version_priority():
-    r"""V+6 位数字 与 semver 共存时 V 优先. 8 位数字会和 V pattern 冲突, 拆成 clean case 测试."""
+    """修复: V+YYMMDD, YYYYMMDD, semver 优先级 + 互不冲突."""
     assert S._extract_version(".../V261017/file.zip") == "2026-10-17"
     assert S._extract_version(".../1.2.3/file.zip") == "v1.2.3"
     assert S._extract_version(".../V260907/...1.2.0.js") == "2026-09-07"
+    assert S._extract_version(".../20261017.zip") == "2026-10-17"
 
 
 # ---------- SourceScore ----------
@@ -107,7 +108,8 @@ def test_source_score_empty():
     assert s.successes == 0
     assert s.failures == 0
     assert s.total_trials == 0
-    assert abs(s.avg_latency_ms - 5250) < 1
+    """修复: 默认 latency 应是 5000 (不是 5250 也不是其他值)."""
+    assert s.avg_latency_ms == 5000
     assert s.success_rate == 0.5
     assert abs(s.score("flac") - 0.5) < 0.001
 
@@ -125,40 +127,37 @@ def test_source_score_all_success_fast():
 
 
 def test_source_score_rate_limited_separate():
-    """rate_limited=True 早返回, 不污染 success/failures."""
+    """修复: rate_limited=True 可单独调用, success 可省略."""
     s = S.SourceScore()
     for _ in range(3):
         s.record(success=True, latency_ms=800)
     for _ in range(5):
-        s.record(rate_limited=True, success=False, latency_ms=5000)
+        s.record(rate_limited=True)  # success 省略, 不再 TypeError
     assert s.rate_limited == 5
     assert s.successes == 3
     assert s.failures == 0
     assert s.total_trials == 3
-    assert s.avg_latency_ms == 800
+    assert s.avg_latency_ms == 800  # rate_limited 的 latency 不入滑动窗口
 
 
 def test_source_score_round_trip():
-    """to_dict/from_dict round-trip. quality_successes 只记成功.
-    recent_latencies 当前不被 from_dict 恢复, s2 默认 avg_latency=5250."""
+    """to_dict/from_dict 完整 round-trip, 包含 rate_limited."""
     s = S.SourceScore()
     s.record(success=True, latency_ms=100, quality="flac")
     s.record(success=True, latency_ms=200, quality="flac")
     s.record(success=False, latency_ms=300, quality="flac")
     s.record(success=False, latency_ms=400, quality="hires")
-    s.record(rate_limited=True, success=False, latency_ms=500)
+    s.record(rate_limited=True)
     data = s.to_dict()
     s2 = S.SourceScore.from_dict(data)
     assert s2.successes == 2
     assert s2.failures == 2
+    assert s2.rate_limited == 1
     assert s2.quality_successes == {"flac": 2}
     assert s2.quality_attempts == {"flac": 3, "hires": 1}
-    # recent_latencies 当前不跨 round-trip, avg_latency 默认值
-    assert abs(s2.avg_latency_ms - 5250) < 1
 
 
 def test_source_score_recent_latency_window():
-    """avg_latency 只取最近 20 个样本 (RECENT_WINDOW)"""
     s = S.SourceScore()
     for _ in range(10):
         s.record(success=True, latency_ms=100)
@@ -168,7 +167,6 @@ def test_source_score_recent_latency_window():
 
 
 def test_handles_forlist_smoke():
-    """空 handles 列表的边界 — 不依赖 node 桥"""
     sm = S.SourceManager(data_dir="/nonexistent", bridge_path="/nonexistent/bridge.mjs", node="node")
     assert sm.handles_for("wy") == []
     assert sm.handles_for_score("wy") == []
