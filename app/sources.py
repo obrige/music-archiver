@@ -33,13 +33,14 @@ SUB_INTERVAL_MIN = 5
 SUB_INTERVAL_MAX = 10080  # 1 周
 SUB_UPDATE_TIMEOUT = 300
 AUTOUPDATER_PARALLEL = 3
-SCORE_SAVE_INTERVAL = 30  # 评分落盘间隔(秒), 防每请求写盘
-BATCH_IMPORT_PARALLEL = 4  # 批量 import 时并发 node spawn 上限
+SCORE_SAVE_INTERVAL = 30
+BATCH_IMPORT_PARALLEL = 4
+# Action precheck: 有些源不声明 actions(老格式), 严格校验只对显式声明的源生效
+STRICT_ACTION_CHECK = True
 
 
 class SourceScore:
-    """单源滚动统计: Bayesian 平滑成功率 + 滑动窗口平均延迟 + 按音质分桶成功率.
-    复合分 score = 0.4 × 音质匹配 + 0.3 × 速度 + 0.3 × 可靠性, 范围 [0, 1], 越高越优先."""
+    """单源滚动统计: Bayesian 平滑成功率 + 滑动窗口平均延迟 + 按音质分桶成功率."""
     RECENT_WINDOW = 20
     BAYES_PRIOR_TRIALS = 5
     BAYES_PRIOR_SUCCESS = 2.5
@@ -145,11 +146,11 @@ class SourceScore:
 
 class LxScriptHandle:
     """Per-source node bridge handle. 每次解析用 _acquire/_release 池化复用进程,
-    大幅减少 cold-start 100ms spawn 开销. 池条目按空闲 TTL + 绝对最大寿命清理."""
+    大幅减少 cold-start 100ms spawn 开销."""
 
-    POOL_MAX = 1       # 每源最多缓存 1 个空闲进程(N 源时内存: N × ~40MB)
-    POOL_TTL = 30      # 空闲 30s 后下次 acquire 时清理
-    POOL_MAX_AGE = 600 # 绝对最大存活 10min(防脚本状态膨胀)
+    POOL_MAX = 1
+    POOL_TTL = 30
+    POOL_MAX_AGE = 600
 
     def __init__(self, script_path, bridge_path, node='node', on_dirty=None):
         self.script_path = str(script_path)
@@ -165,7 +166,9 @@ class LxScriptHandle:
         self._rate_lock = threading.Lock()
         self._rate_last = [0.0]
         self._rate_interval = 0.5
-        # 进程池: list of (proc, q, last_used_ts, create_ts)
+        # init 健康: 'pending' | 'ok' | 'fail'; fail 时 _init_error 有详情
+        self.init_status = 'pending'
+        self.init_error = None
         self._pool = []
         self._pool_lock = threading.Lock()
         self._load_meta()
@@ -228,7 +231,6 @@ class LxScriptHandle:
         return err
 
     def _acquire(self):
-        """从池里拿一个健康进程(未过期); 没有或全过期则 spawn 新. 同时清理池中废条目."""
         with self._pool_lock:
             now = _time.time()
             fresh = []
@@ -241,7 +243,6 @@ class LxScriptHandle:
                     continue
                 fresh.append(entry)
             self._pool = fresh
-            # 拿一个健康的, 同时清空残留消息(console / bridge-ready / 上次未消费完的)
             while self._pool:
                 entry = self._pool.pop(0)
                 proc, q = entry[0], entry[1]
@@ -251,7 +252,6 @@ class LxScriptHandle:
             return self._spawn()
 
     def _release(self, proc, q):
-        """用完放回池里. 已死/已满则丢弃."""
         with self._pool_lock:
             try:
                 if proc.poll() is not None:
@@ -282,7 +282,17 @@ class LxScriptHandle:
                 mtype = msg.get('type')
                 if mtype == 'meta':
                     self.name = msg.get('name') or '未命名音源'
-                    self.sources = msg.get('sources') or {}
+                    raw_sources = msg.get('sources') or {}
+                    # 规整化 sources: actions 缺省时补 ['musicUrl'], 兼容老格式脚本
+                    self.sources = {}
+                    for plat, info in raw_sources.items():
+                        info = dict(info or {})
+                        actions = info.get('actions')
+                        if not actions:
+                            actions = ['musicUrl']
+                        info['actions'] = list(actions)
+                        self.sources[plat] = info
+                    self.init_status = 'ok'
                     return
                 if mtype == 'console':
                     log.debug('script console: %s', msg.get('msg'))
@@ -291,8 +301,14 @@ class LxScriptHandle:
                     raise RuntimeError(msg.get('error') or '音源脚本初始化失败')
         except queue.Empty:
             err = self._read_stderr(proc)
+            self.init_status = 'fail'
+            self.init_error = (err.strip() if err.strip() else '未在超时内收到 meta')
             self._kill(proc)
-            raise RuntimeError('音源脚本初始化失败: ' + (err.strip() if err.strip() else '未在超时内收到 meta'))
+            raise RuntimeError('音源脚本初始化失败: ' + self.init_error)
+        except Exception as e:
+            self.init_status = 'fail'
+            self.init_error = str(e)[:200]
+            raise
         finally:
             try:
                 self._release(proc, q)
@@ -318,10 +334,17 @@ class LxScriptHandle:
         info = self.sources.get(platform) or {}
         return info.get('actions') or []
 
+    def _supports_action(self, platform, action):
+        """严格检查: 仅当脚本显式声明 actions 且不含目标 action 时拒绝.
+        老格式脚本(actions 缺失)兼容: 视为全支持."""
+        actions = self._actions_for(platform)
+        if not actions:
+            return True  # 老格式: 不挡
+        return action in actions
+
     def resolve(self, source, song, quality):
-        actions = self._actions_for(source)
-        if actions and 'musicUrl' not in actions:
-            raise RuntimeError(f'{self.name or "音源"} 不支持 {source} 的 musicUrl action')
+        if not self._supports_action(source, 'musicUrl'):
+            raise RuntimeError(f'{self.name or "音源"} 不支持 {source} 的 musicUrl (actions={self._actions_for(source)})')
 
         t0 = _time.time()
         proc, q = None, None
@@ -379,9 +402,8 @@ class LxScriptHandle:
             self._rate_last[0] = _time.time()
 
     def resolve_multi(self, platform, song, qualities, overall_timeout=30):
-        actions = self._actions_for(platform)
-        if actions and 'musicUrl' not in actions:
-            raise RuntimeError(f'{self.name or "音源"} 不支持 {platform} 的 musicUrl action')
+        if not self._supports_action(platform, 'musicUrl'):
+            raise RuntimeError(f'{self.name or "音源"} 不支持 {platform} 的 musicUrl')
 
         self._throttle()
         proc, q = None, None
@@ -411,6 +433,8 @@ class LxScriptHandle:
                             log.debug('script console: %s', msg.get('msg'))
                         continue
                     if msg.get('ok') is False:
+                        # 单个 quality 失败不 break, 跳过继续试下一个
+                        log.debug('%s: quality %s 失败: %s', self.name, quality, msg.get('error'))
                         break
                     if msg.get('ok'):
                         results[quality] = (msg.get('data') or {}).get('url')
@@ -433,10 +457,12 @@ class LxScriptHandle:
 
     def search(self, platform, keyword, page=1, limit=30):
         actions = self._actions_for(platform)
+        # search 类 action: 老格式脚本用 'search', 新格式用 'musicSearch'; 两者都接受
         if actions and 'musicSearch' not in actions and 'search' not in actions:
-            raise RuntimeError(f'{self.name or "音源"} 不支持 {platform} 的搜索 action')
+            raise RuntimeError(f'{self.name or "音源"} 不支持 {platform} 的搜索 (actions={actions})')
 
-        actions = (self.sources.get(platform) or {}).get('actions') or []
+        actions = self.sources.get(platform) or {}
+        actions = actions.get('actions') or []
         action = 'musicSearch' if 'musicSearch' in actions else 'search'
         t0 = _time.time()
         proc, q = None, None
@@ -513,6 +539,8 @@ class SourceManager:
                         h = LxScriptHandle(script_file, self.bridge_path, self.node, on_dirty=self._mark_dirty)
                         h.id = e['id']
                         h.last_success = e.get('lastSuccess')
+                        h.init_status = e.get('initStatus', 'ok')
+                        h.init_error = e.get('initError')
                         score_data = e.get('score')
                         if score_data:
                             h.score = SourceScore.from_dict(score_data)
@@ -572,6 +600,8 @@ class SourceManager:
                     'raw': raw,
                     'lastSuccess': h.last_success,
                     'score': h.score.to_dict(),
+                    'initStatus': getattr(h, 'init_status', 'ok'),
+                    'initError': getattr(h, 'init_error', None),
                 })
             content = json.dumps(entries, ensure_ascii=False, indent=2)
             tmp = self.store_file.with_suffix('.json.tmp')
@@ -657,7 +687,8 @@ class SourceManager:
         failed = []
         for fn, h, err in results:
             if h:
-                added.append({'id': h.id, 'name': h.name, 'file': fn})
+                added.append({'id': h.id, 'name': h.name, 'file': fn, 'initStatus': h.init_status,
+                              'initError': h.init_error if h.init_status != 'ok' else None})
             else:
                 failed.append({'file': fn, 'error': err or '未知错误'})
         if added:
@@ -698,7 +729,8 @@ class SourceManager:
             if raw.startswith('PARSE_ERR:'):
                 failed.append({'file': fn, 'error': raw[10:]})
             elif h:
-                added.append({'id': h.id, 'name': h.name, 'file': fn})
+                added.append({'id': h.id, 'name': h.name, 'file': fn, 'initStatus': h.init_status,
+                              'initError': h.init_error if h.init_status != 'ok' else None})
             else:
                 failed.append({'file': fn, 'error': err or '未知错误'})
         if added:
@@ -756,11 +788,14 @@ class SourceManager:
         return [{
             'id': sid, 'name': h.name, 'kind': 'lxScript', 'sources': h.sources,
             'lastSuccess': h.last_success, 'score': h.score.to_dict(),
+            'initStatus': getattr(h, 'init_status', 'ok'),
+            'initError': getattr(h, 'init_error', None),
         } for sid, h in self.handles.items()]
 
     def scores_map(self):
         return {
-            sid: {'name': h.name, 'score': h.score.to_dict(), 'lastSuccess': h.last_success}
+            sid: {'name': h.name, 'score': h.score.to_dict(), 'lastSuccess': h.last_success,
+                  'initStatus': getattr(h, 'init_status', 'ok')}
             for sid, h in self.handles.items()
         }
 
