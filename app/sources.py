@@ -21,6 +21,7 @@ import time as _time
 import urllib.request
 import uuid
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 log = logging.getLogger('musicarchiver.sources')
@@ -32,6 +33,7 @@ SUB_INTERVAL_MAX = 10080  # 1 周
 SUB_UPDATE_TIMEOUT = 300
 AUTOUPDATER_PARALLEL = 3
 SCORE_SAVE_INTERVAL = 30  # 评分落盘间隔(秒), 防每请求写盘
+BATCH_IMPORT_PARALLEL = 4  # 批量 import 时并发 node spawn 上限
 
 
 class SourceScore:
@@ -49,13 +51,20 @@ class SourceScore:
     def __init__(self):
         self.successes = 0
         self.failures = 0
+        self.rate_limited = 0      # 限流次数(行业标准 code 5), 跟踪但不计入普通失败
         self.last_success_at = None
         self.last_failure_at = None
+        self.last_rate_limit_at = None
         self.quality_attempts = {}   # quality -> int
         self.quality_successes = {}
         self.recent_latencies = []   # last RECENT_WINDOW (ms)
 
-    def record(self, success, latency_ms=None, quality=None):
+    def record(self, success, latency_ms=None, quality=None, rate_limited=False):
+        if rate_limited:
+            # 限流(code 5)不计入普通失败, 但记录以便前端可观测
+            self.rate_limited += 1
+            self.last_rate_limit_at = _time.time()
+            return
         if quality:
             self.quality_attempts[quality] = self.quality_attempts.get(quality, 0) + 1
         if success:
@@ -86,26 +95,23 @@ class SourceScore:
     def avg_latency_ms(self):
         if self.recent_latencies:
             return sum(self.recent_latencies) / len(self.recent_latencies)
-        return (self.LATENCY_FAST_MS + self.LATENCY_SLOW_MS) / 2  # 中位假设
+        return (self.LATENCY_FAST_MS + self.LATENCY_SLOW_MS) / 2
 
     def quality_score(self, quality):
-        """该源对此音质的把握: 0-1, 0.5 = 无数据"""
         a = self.quality_attempts.get(quality, 0)
         if a == 0:
             return 0.5
         s = self.quality_successes.get(quality, 0)
-        return (s + 1) / (a + 2)  # Bayesian 平滑
+        return (s + 1) / (a + 2)
 
     def score(self, requested_quality=None):
         """综合分: 0-1, 越高越优先."""
         if requested_quality:
             qs = self.quality_score(requested_quality)
         else:
-            # 无指定音质: 用总成功率
             ta = sum(self.quality_attempts.values())
             ts = sum(self.quality_successes.values())
             qs = (ts + 1) / (ta + 2) if ta else 0.5
-        # 速度分: 0..1, LATENCY_FAST_MS -> 1, LATENCY_SLOW_MS -> 0
         lat = self.avg_latency_ms
         spd = max(0.0, min(1.0, (self.LATENCY_SLOW_MS - lat) / (self.LATENCY_SLOW_MS - self.LATENCY_FAST_MS)))
         rel = self.success_rate
@@ -115,10 +121,12 @@ class SourceScore:
         return {
             'successes': self.successes,
             'failures': self.failures,
+            'rateLimited': self.rate_limited,
             'successRate': round(self.success_rate, 3),
             'avgLatencyMs': int(self.avg_latency_ms),
             'lastSuccessAt': self.last_success_at,
             'lastFailureAt': self.last_failure_at,
+            'lastRateLimitAt': self.last_rate_limit_at,
             'qualitySuccess': dict(self.quality_successes),
             'qualityAttempts': dict(self.quality_attempts),
         }
@@ -128,8 +136,10 @@ class SourceScore:
         s = cls()
         s.successes = int(d.get('successes') or 0)
         s.failures = int(d.get('failures') or 0)
+        s.rate_limited = int(d.get('rateLimited') or 0)
         s.last_success_at = d.get('lastSuccessAt')
         s.last_failure_at = d.get('lastFailureAt')
+        s.last_rate_limit_at = d.get('lastRateLimitAt')
         s.quality_successes = dict(d.get('qualitySuccess') or {})
         s.quality_attempts = dict(d.get('qualityAttempts') or {})
         return s
@@ -145,12 +155,24 @@ class LxScriptHandle:
         self.sources = {}
         self.last_success = None
         self.score = SourceScore()
-        self._on_dirty = on_dirty  # callback when score changes (用于触发持久化)
-        # 单音源限速(不同音源互不干扰, 每个音源自身请求间隔 0.5s 防 429)
+        self._on_dirty = on_dirty
+        # raw 文本懒加载缓存: 避免每次 _save() 重读磁盘
+        self._raw_cache = None
+        # 单源限速(不同源互不干扰, 每源自身请求间隔 0.5s 防 429)
         self._rate_lock = threading.Lock()
         self._rate_last = [0.0]
         self._rate_interval = 0.5
         self._load_meta()
+
+    def _get_raw(self):
+        """惰性读脚本文本, 缓存避免每次 _save 重读磁盘. 进程内生命周期内稳定."""
+        if self._raw_cache is None:
+            try:
+                with open(self.script_path, 'r', encoding='utf-8') as f:
+                    self._raw_cache = f.read()
+            except Exception:
+                self._raw_cache = ''
+        return self._raw_cache
 
     def _spawn(self):
         proc = subprocess.Popen(
@@ -222,19 +244,37 @@ class LxScriptHandle:
         finally:
             self._kill(proc)
 
-    def _record(self, success, latency_ms, quality):
-        """记录一次调用结果到评分系统; 标记脏, 由 SourceManager 周期落盘."""
-        self.score.record(success, latency_ms, quality)
+    def _record(self, success, latency_ms, quality, rate_limited=False):
+        self.score.record(success, latency_ms, quality, rate_limited=rate_limited)
         if self._on_dirty:
             try:
                 self._on_dirty()
             except Exception:
                 log.exception('on_dirty callback failed')
 
+    @staticmethod
+    def _detect_rate_limit(err_msg):
+        """行业惯例: 上游返回 code 5 / "too many requests" 表示限流(非真实失败)."""
+        if not err_msg:
+            return False
+        e = err_msg.lower()
+        return ('code 5' in e) or ('too many requests' in e) or ('rate limit' in e) or ('限流' in err_msg) or ('频繁' in err_msg)
+
+    def _actions_for(self, platform):
+        """该源对此平台声明支持的动作. 预检避免无谓 spawn."""
+        info = self.sources.get(platform) or {}
+        return info.get('actions') or []
+
     def resolve(self, source, song, quality):
+        # 预检: 源声明不支持 musicUrl 时直接报错, 不浪费 node spawn
+        actions = self._actions_for(source)
+        if actions and 'musicUrl' not in actions:
+            raise RuntimeError(f'{self.name or "音源"} 不支持 {source} 的 musicUrl action')
+
         t0 = _time.time()
         proc, q = self._spawn()
         success = False
+        rate_limited = False
         try:
             req = {'source': source, 'action': 'musicUrl',
                    'info': {'musicInfo': dict(song), 'type': quality}}
@@ -252,7 +292,9 @@ class LxScriptHandle:
                         log.debug('script console: %s', msg.get('msg'))
                     continue
                 if msg.get('ok') is False:
-                    raise RuntimeError(msg.get('error') or '音源解析失败')
+                    err = msg.get('error') or '音源解析失败'
+                    rate_limited = self._detect_rate_limit(err)
+                    raise RuntimeError(err)
                 if msg.get('ok'):
                     success = True
                     self.last_success = _time.time()
@@ -263,7 +305,7 @@ class LxScriptHandle:
         finally:
             self._kill(proc)
             ms = int((_time.time() - t0) * 1000)
-            self._record(success, ms if success else None, quality)
+            self._record(success, ms if success else None, quality, rate_limited=rate_limited)
 
     def _throttle(self):
         with self._rate_lock:
@@ -274,7 +316,10 @@ class LxScriptHandle:
             self._rate_last[0] = _time.time()
 
     def resolve_multi(self, platform, song, qualities, overall_timeout=30):
-        """同一桥进程内依次解析多个音质(校验用, 快 N 倍); 整体超时避免慢源拖累"""
+        actions = self._actions_for(platform)
+        if actions and 'musicUrl' not in actions:
+            raise RuntimeError(f'{self.name or "音源"} 不支持 {platform} 的 musicUrl action')
+
         self._throttle()
         proc, q = self._spawn()
         deadline_all = _time.time() + overall_timeout
@@ -287,7 +332,6 @@ class LxScriptHandle:
                        'info': {'musicInfo': dict(song), 'type': quality}}
                 proc.stdin.write(json.dumps(req, ensure_ascii=False) + '\n')
                 proc.stdin.flush()
-                # 实时性: 单音质最多等 18s, 且不超过整体超时
                 deadline = min(_time.time() + 18, deadline_all)
                 while True:
                     remain = deadline - _time.time()
@@ -312,20 +356,21 @@ class LxScriptHandle:
             return results
         finally:
             self._kill(proc)
-            # 整体一次计为一次调用, 记到"无指定音质"的综合分
             t_end = _time.time()
-            ms = int((t_end - deadline_all + overall_timeout) * 1000) if False else 0
-            # 暂用整体耗时估值(总超时作为上限)
             ms = int(overall_timeout * 1000) if not results else int((overall_timeout - max(0, deadline_all - t_end)) * 1000)
             self._record(bool(results), ms, None)
 
     def search(self, platform, keyword, page=1, limit=30):
-        """脚本原生搜索(需音源声明 search/musicSearch action)"""
+        actions = self._actions_for(platform)
+        if actions and 'musicSearch' not in actions and 'search' not in actions:
+            raise RuntimeError(f'{self.name or "音源"} 不支持 {platform} 的搜索 action')
+
         actions = (self.sources.get(platform) or {}).get('actions') or []
         action = 'musicSearch' if 'musicSearch' in actions else 'search'
         t0 = _time.time()
         proc, q = self._spawn()
         success = False
+        rate_limited = False
         try:
             req = {'source': platform, 'action': action, 'info': {'keyword': keyword, 'page': page, 'limit': limit}}
             proc.stdin.write(json.dumps(req, ensure_ascii=False) + '\n')
@@ -340,7 +385,9 @@ class LxScriptHandle:
                 if mtype in ('bridge', 'meta', 'console'):
                     continue
                 if msg.get('ok') is False:
-                    raise RuntimeError(msg.get('error') or '搜索失败')
+                    err = msg.get('error') or '搜索失败'
+                    rate_limited = self._detect_rate_limit(err)
+                    raise RuntimeError(err)
                 if msg.get('ok'):
                     success = True
                     data = msg.get('data') or {}
@@ -350,7 +397,7 @@ class LxScriptHandle:
         finally:
             self._kill(proc)
             ms = int((_time.time() - t0) * 1000)
-            self._record(success, ms if success else None, None)
+            self._record(success, ms if success else None, None, rate_limited=rate_limited)
 
     def close(self):
         pass
@@ -364,11 +411,12 @@ class SourceManager:
         self.bridge_path = bridge_path
         self.node = node
         self.handles = {}
-        # 原子写入 + 评分落盘
         self._save_lock = threading.Lock()
         self._dirty = False
         self._save_stop = threading.Event()
         self._save_thread = None
+        # 批量 import 时让 _add 并发跑, 减少大 ZIP import 的串行 spawn 等待
+        self._import_executor = None
 
     def init(self):
         if self.store_file.exists():
@@ -382,7 +430,6 @@ class SourceManager:
                         h = LxScriptHandle(script_file, self.bridge_path, self.node, on_dirty=self._mark_dirty)
                         h.id = e['id']
                         h.last_success = e.get('lastSuccess')
-                        # 恢复评分
                         score_data = e.get('score')
                         if score_data:
                             h.score = SourceScore.from_dict(score_data)
@@ -393,7 +440,6 @@ class SourceManager:
                 log.info('sources: 已恢复 %d 个音源', recovered)
             except Exception as e:
                 log.warning('sources: 读取 sources.json 失败: %s', e)
-        # 启动周期落盘线程
         self._start_periodic_save()
 
     def _start_periodic_save(self):
@@ -404,12 +450,10 @@ class SourceManager:
         log.debug('sources-save: 后台落盘线程启动, 间隔 %ds', SCORE_SAVE_INTERVAL)
 
     def _mark_dirty(self):
-        """评分变更回调: 标记脏, 落盘线程 30s 内写盘."""
         self._dirty = True
 
     def _save_loop(self):
         while not self._save_stop.is_set():
-            # 可中断 sleep
             for _ in range(SCORE_SAVE_INTERVAL):
                 if self._save_stop.is_set():
                     return
@@ -434,15 +478,13 @@ class SourceManager:
         return f
 
     def _save(self):
-        """原子写入: tmp + os.replace, 配合 _save_lock 防并发损坏 sources.json"""
+        """原子写入: tmp + os.replace, 配合 _save_lock 防并发损坏 sources.json.
+        使用 handle._get_raw() 内存缓存, 避免每次重读 .js 文件."""
         with self._save_lock:
             self.data_dir.mkdir(parents=True, exist_ok=True)
             entries = []
             for sid, h in self.handles.items():
-                try:
-                    raw = (self.scripts_dir / (sid + '.js')).read_text('utf-8')
-                except Exception:
-                    raw = ''
+                raw = h._get_raw() if hasattr(h, '_get_raw') else ''
                 entries.append({
                     'id': sid,
                     'name': h.name,
@@ -474,6 +516,25 @@ class SourceManager:
         self.handles[sid] = h
         return h
 
+    def _add_batch(self, raws_with_names):
+        """批量并发初始化 handle(meta 并行加载), 适用于 ZIP 一次性几十上百个 .js.
+        raws_with_names: list of (filename, raw_text) tuples."""
+        if not raws_with_names:
+            return []
+
+        def _do_one(item):
+            fn, raw = item
+            try:
+                h = self._add(raw)
+                return (fn, h, None)
+            except Exception as e:
+                return (fn, None, str(e)[:120])
+
+        workers = min(len(raws_with_names), BATCH_IMPORT_PARALLEL)
+        # 复用短命 executor; 不用 self._import_executor 以免和并发 import 互踩
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            return list(ex.map(_do_one, raws_with_names))
+
     def import_script(self, raw):
         h = self._add(raw)
         self._save()
@@ -489,31 +550,50 @@ class SourceManager:
 
     # ---- 批量 / 压缩包 ----
     def import_from_files(self, files):
-        """从前端 multipart 传入的多个 File 对象批量导入.
-        files: iterable of file-like (有 .read() / .filename) 或 (filename, raw_bytes) 元组"""
-        added, failed = [], []
-        for item in files:
+        """从前端 multipart 传入的多个 File 对象批量导入."""
+        items = []
+        for f in files:
             try:
-                if isinstance(item, tuple):
-                    fn, raw_bytes = item
-                    fn = fn or '?'
-                    raw = raw_bytes.decode('utf-8', 'replace') if isinstance(raw_bytes, (bytes, bytearray)) else str(raw_bytes)
+                if isinstance(f, tuple):
+                    items.append((f[0] or '?', f[1]))
                 else:
-                    fn = getattr(item, 'filename', None) or '?'
-                    raw_bytes = item.read()
-                    raw = raw_bytes.decode('utf-8', 'replace') if isinstance(raw_bytes, (bytes, bytearray)) else str(raw_bytes)
-                h = self._add(raw)
-                added.append({'id': h.id, 'name': h.name, 'file': fn})
+                    raw_bytes = f.read()
+                    items.append((getattr(f, 'filename', None) or '?', raw_bytes))
             except Exception as e:
-                failed.append({'file': getattr(item, 'filename', '?'), 'error': str(e)[:120]})
-        if added or failed:
+                items.append((getattr(f, 'filename', '?'), None))
+
+        parsed = []
+        for fn, raw_bytes in items:
+            if raw_bytes is None:
+                continue
+            try:
+                if isinstance(raw_bytes, (bytes, bytearray)):
+                    raw_text = raw_bytes.decode('utf-8', 'replace')
+                else:
+                    raw_text = str(raw_bytes)
+            except Exception:
+                continue
+            if not raw_text.lstrip().startswith(('/*', '//', 'var ', 'const ', 'let ', 'function', 'export')) and '.js' not in (fn or '').lower():
+                # 兜底: 文件名后缀是 .js 就当 JS 处理
+                pass
+            parsed.append((fn, raw_text))
+
+        # 并发跑 meta 加载
+        results = self._add_batch(parsed)
+        added = []
+        failed = []
+        for fn, h, err in results:
+            if h:
+                added.append({'id': h.id, 'name': h.name, 'file': fn})
+            else:
+                failed.append({'file': fn, 'error': err or '未知错误'})
+        if added:
             self._save()
         return {'added': added, 'failed': failed}
 
-    def import_from_zip_path(self, zip_path):
-        """从磁盘 ZIP 路径提取所有 .js. 流式上传的主入口(避免 OOM).
-        跳过目录条目 / 隐藏文件 / 非 .js."""
-        added, failed = [], []
+    def _zip_extract_js(self, zip_path):
+        """从 ZIP 提取 (filename, content) 列表, 跳过目录/隐藏/非.js."""
+        out = []
         try:
             z = zipfile.ZipFile(zip_path)
         except Exception as e:
@@ -527,50 +607,47 @@ class SourceManager:
                     continue
                 try:
                     raw = z.read(name).decode('utf-8', 'replace')
-                    h = self._add(raw)
-                    added.append({'id': h.id, 'name': h.name, 'file': name})
+                    out.append((name, raw))
                 except Exception as e:
-                    failed.append({'file': name, 'error': str(e)[:120]})
+                    out.append((name, 'PARSE_ERR:' + str(e)))
         finally:
             try:
                 z.close()
             except Exception:
                 pass
+        return out
+
+    def import_from_zip_path(self, zip_path):
+        entries = self._zip_extract_js(zip_path)
+        results = self._add_batch([(fn, raw) for fn, raw in entries if not raw.startswith('PARSE_ERR:')])
+        added = []
+        failed = []
+        for (fn, raw), (_fn2, h, err) in zip(entries, results):
+            if raw.startswith('PARSE_ERR:'):
+                failed.append({'file': fn, 'error': raw[10:]})
+            elif h:
+                added.append({'id': h.id, 'name': h.name, 'file': fn})
+            else:
+                failed.append({'file': fn, 'error': err or '未知错误'})
         if added:
             self._save()
         return {'added': added, 'failed': failed}
 
     def import_from_zip_bytes(self, raw_bytes):
-        """从 ZIP 字节流提取所有 .js. 适合小 ZIP; 大 ZIP 走 import_from_zip_path 流式"""
-        added, failed = [], []
+        """适合小 ZIP, 大 ZIP 推荐 import_from_zip_path 流式"""
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix='.zip', delete=False) as tmp:
+            tmp.write(raw_bytes)
+            tmp_path = tmp.name
         try:
-            z = zipfile.ZipFile(io.BytesIO(raw_bytes))
-        except Exception as e:
-            raise RuntimeError('不是有效的 ZIP 文件: ' + str(e))
-        try:
-            for name in z.namelist():
-                if name.endswith('/'):
-                    continue
-                base = name.split('/')[-1]
-                if base.startswith('.') or not base.lower().endswith('.js'):
-                    continue
-                try:
-                    raw = z.read(name).decode('utf-8', 'replace')
-                    h = self._add(raw)
-                    added.append({'id': h.id, 'name': h.name, 'file': name})
-                except Exception as e:
-                    failed.append({'file': name, 'error': str(e)[:120]})
+            return self.import_from_zip_path(tmp_path)
         finally:
             try:
-                z.close()
+                os.unlink(tmp_path)
             except Exception:
                 pass
-        if added:
-            self._save()
-        return {'added': added, 'failed': failed}
 
     def import_from_url_zip(self, url):
-        """下载 URL 指向的 ZIP 后批量导入"""
         req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
         with urllib.request.urlopen(req, timeout=60) as r:
             if r.status != 200:
@@ -585,6 +662,7 @@ class SourceManager:
         if h is None:
             return False
         h.close()
+        h._raw_cache = None  # 释放缓存
         self._save()
         return True
 
@@ -592,7 +670,6 @@ class SourceManager:
         return self.handles.get(sid)
 
     def handles_for(self, platform):
-        """支持指定平台的所有音源句柄(自动解析用)"""
         return [h for h in self.handles.values() if platform in h.sources]
 
     def handles_for_score(self, platform, quality=None):
@@ -601,7 +678,6 @@ class SourceManager:
         return sorted(handles, key=lambda h: -h.score.score(quality))
 
     def handles_topk(self, platform, quality=None, k=3):
-        """按分数取 top-K 句柄. 至少返回 1 个; 不足则全返."""
         if k < 1:
             k = 1
         return self.handles_for_score(platform, quality)[:k]
@@ -613,7 +689,6 @@ class SourceManager:
         } for sid, h in self.handles.items()]
 
     def scores_map(self):
-        """id -> { name, score, lastSuccess } 精简视图, 供前端快速获取."""
         return {
             sid: {'name': h.name, 'score': h.score.to_dict(), 'lastSuccess': h.last_success}
             for sid, h in self.handles.items()
@@ -625,8 +700,7 @@ class SourceManager:
 
 class SubscriptionManager:
     """订阅分组: 一组 URL(.js / .zip 混合), 定时整体刷新.
-    per-group 锁防止 update()/remove()/并发的 AutoUpdater 刷新互踩.
-    刷新时清理上一次导入的 source, 再重下."""
+    per-group 锁防止 update()/remove()/并发的 AutoUpdater 刷新互踩."""
     def __init__(self, data_dir, source_manager):
         self.data_dir = Path(data_dir)
         self.store_file = self.data_dir / 'subscriptions.json'
@@ -750,8 +824,7 @@ class SubscriptionManager:
 
 
 class AutoUpdater:
-    """后台守护线程: 每 N 秒扫一遍订阅组, 到点的并行触发 update.
-    单组间隔下限 5 分钟(防滥用), 上限 1 周. 并行上限 3 个."""
+    """后台守护线程: 每 N 秒扫一遍订阅组, 到点的并行触发 update."""
     def __init__(self, sub_manager, check_interval_sec=30):
         self.sm = sub_manager
         self.check_interval = max(5, int(check_interval_sec))
