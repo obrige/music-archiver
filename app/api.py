@@ -1,5 +1,13 @@
 # -*- coding: utf-8 -*-
-"""全部 API 路由(Python 版 + 洛雪音源沙箱)"""
+"""全部 API 路由(Python 版 + 洛雪音源沙箱)
+
+扩展:
+- /api/sources/import-files: 批量上传 .js 文件(多选/文件夹)
+- /api/sources/import-zip:  上传 ZIP 批量导入
+- /api/sources/import-zip-url: 下载 URL 指向的 ZIP 批量导入
+- /api/subscriptions: 订阅分组 CRUD
+- /api/subscriptions/{gid}/refresh: 手动触发刷新
+"""
 import asyncio
 import json
 import re
@@ -233,7 +241,6 @@ async def resolve_all_stream(body: dict, request: Request):
     return StreamingResponse(gen(), media_type='text/event-stream', headers={'Cache-Control': 'no-cache'})
 
 
-
 def _norm_rel(href, base_path):
     """从 propfind href 得到规范化相对路径: 解实体后重新编码(& → %26, 空格 → %20 等)"""
     if not href or not href.startswith(base_path):
@@ -310,7 +317,6 @@ def _run_backfill(task_q, task, cfg, sm):
                 if not song:
                     task_q.log(task, '[%s] 未找到精确匹配歌曲' % platform)
                     return
-
 
                 entries = _collect_entries(platform, song, sm.handles_for(platform))
                 if not entries:
@@ -476,6 +482,7 @@ def resolve_all(body: dict, request: Request):
     for q, urls in collected.items():
         for url in urls:
             tasks.append((q, url))
+
     def _head_worker(q, url):
         head, size = download_head(url, 16384, 15)
         if not head or head[:4] != b'fLaC':
@@ -484,6 +491,7 @@ def resolve_all(body: dict, request: Request):
         fi = parse_flac_info(head)
         return {'quality': q, 'url': url, 'spec': spec, 'size': size,
                 'sr': fi['sr'] if fi else 0, 'bits': fi['bits'] if fi else 0}
+
     if tasks:
         from concurrent.futures import ThreadPoolExecutor as _T2
         with _T2(max_workers=min(len(tasks), 30)) as ex:
@@ -556,12 +564,117 @@ def import_file(body: dict, request: Request):
         raise HTTPException(400, str(e))
 
 
+@router.post('/api/sources/import-files')
+async def import_files(request: Request):
+    """批量上传多个 .js 文件(来自文件夹选择 / 多选). 表单字段: files (multipart, 多个)"""
+    try:
+        form = await request.form()
+        files = form.getlist('files')
+        if not files:
+            raise HTTPException(400, '未提供文件')
+        return request.app.state.sm.import_from_files(files)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(400, str(e))
+
+
+@router.post('/api/sources/import-zip')
+async def import_zip(request: Request):
+    """上传 ZIP 批量导入. 表单字段: file (multipart, 单个 .zip)"""
+    try:
+        form = await request.form()
+        f = form.get('file')
+        if not f:
+            raise HTTPException(400, '未提供 ZIP 文件')
+        raw = await f.read()
+        if not raw:
+            raise HTTPException(400, 'ZIP 文件为空')
+        return request.app.state.sm.import_from_zip_bytes(raw)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(400, 'ZIP 解压失败: ' + str(e))
+
+
+@router.post('/api/sources/import-zip-url')
+def import_zip_url(body: dict, request: Request):
+    """下载 URL 指向的 ZIP 后批量导入. body: { url }"""
+    url = str((body or {}).get('url') or '').strip()
+    if not re.match(r'^https?://', url):
+        raise HTTPException(400, 'url 必须为 http(s) 链接')
+    try:
+        return request.app.state.sm.import_from_url_zip(url)
+    except Exception as e:
+        raise HTTPException(400, str(e))
+
+
 @router.delete('/api/sources/{sid}')
 def remove_source(sid: str, request: Request):
     ok = request.app.state.sm.remove(sid)
     if not ok:
         raise HTTPException(404, '音源不存在')
     return {'ok': True}
+
+
+# ---------- 订阅分组(自动定时刷新) ----------
+@router.get('/api/subscriptions')
+def list_subs(request: Request):
+    return request.app.state.subm.list()
+
+
+@router.post('/api/subscriptions')
+def add_sub(body: dict, request: Request):
+    """新建订阅组, urls 支持字符串(URL)或 {url, kind:'js'|'zip'}; 创建后立即拉一次"""
+    b = body or {}
+    name = str(b.get('name') or '').strip()
+    if not name:
+        raise HTTPException(400, '需要 name')
+    raw_urls = b.get('urls') or []
+    if not isinstance(raw_urls, list) or not raw_urls:
+        raise HTTPException(400, '需要至少一个 URL')
+    norm = []
+    for u in raw_urls:
+        if isinstance(u, str):
+            url = u.strip()
+            if not url:
+                continue
+            kind = 'zip' if url.lower().split('?', 1)[0].endswith('.zip') else 'js'
+            norm.append({'url': url, 'kind': kind})
+        elif isinstance(u, dict):
+            url = str(u.get('url') or '').strip()
+            kind = str(u.get('kind') or 'js')
+            if kind not in ('js', 'zip'):
+                kind = 'js'
+            if url:
+                norm.append({'url': url, 'kind': kind})
+    if not norm:
+        raise HTTPException(400, 'urls 为空')
+    interval = int(b.get('intervalMin') or 60)
+    subm = request.app.state.subm
+    gid = subm.add(name, norm, interval)
+    try:
+        subm.update(gid)
+    except Exception as e:
+        return {'id': gid, 'initialFetchError': str(e)[:200]}
+    return {'id': gid}
+
+
+@router.delete('/api/subscriptions/{gid}')
+def remove_sub(gid: str, request: Request):
+    ok = request.app.state.subm.remove(gid)
+    if not ok:
+        raise HTTPException(404, '订阅组不存在')
+    return {'ok': True}
+
+
+@router.post('/api/subscriptions/{gid}/refresh')
+def refresh_sub(gid: str, request: Request):
+    """手动触发刷新该组"""
+    try:
+        return request.app.state.subm.update(gid)
+    except Exception as e:
+        raise HTTPException(400, str(e))
 
 
 # ---------- WebDAV ----------
