@@ -7,6 +7,7 @@
     searchList: [], tasks: [], library: [], sseState: '未连接', now: null,
     subEditor: null,
     subBusy: null,
+    libPath: '',
   }
 
   // 平台显示名与可搜索平台
@@ -61,11 +62,11 @@
   function compositeScore(s) {
     var sc = s.score || {}
     var n = (sc.successes || 0) + (sc.failures || 0)
-    if (n === 0) return 0.5  // 无数据, 中性
+    if (n === 0) return 0.5
     var sr = sc.successRate || 0
     var avg = sc.avgLatencyMs || 5000
     var spd = Math.max(0, Math.min(1, (10000 - avg) / 9500))
-    return 0.4 * 0.5 + 0.3 * spd + 0.3 * sr  // 质量分 0.5 (无数据), 速度+可靠性加权
+    return 0.4 * 0.5 + 0.3 * spd + 0.3 * sr
   }
 
   function api(path, opts) {
@@ -97,7 +98,6 @@
     return '<span class="badge ' + cls + '">' + txt + '</span>'
   }
 
-  // 音源评分 cell: 成功率 badge + 延迟 + 综合分 + 调用次数
   function scoreHtml(s) {
     var sc = s.score || {}
     var n = (sc.successes || 0) + (sc.failures || 0)
@@ -112,7 +112,6 @@
            '<span style="color:#64748b;font-size:12px">' + lat + ' · 分 ' + comp + ' · n=' + n + '</span>'
   }
 
-  // ---------- toast ----------
   function toast(msg, type) {
     var box = document.getElementById('toast-box')
     if (!box) {
@@ -137,7 +136,6 @@
     return state.sources.find(function (s) { return s.id === state.activeSourceId })
   }
 
-  // ---------- 标签页 ----------
   function switchTab(tab) {
     state.tab = tab
     ;['search', 'tasks', 'library', 'settings'].forEach(function (t) {
@@ -149,7 +147,6 @@
     if (tab === 'settings') { loadSettings(); renderSubs() }
   }
 
-  // ---------- 音源与平台 ----------
   var OFFICIAL = ['wy', 'kg', 'tx', 'kw', 'mg']
   function renderPlatforms() {
     var sel = $('platform')
@@ -188,7 +185,6 @@
     var tbody = $('source-tbody')
     toggleEmpty('source-empty', state.sources)
     if (!state.sources.length) { tbody.innerHTML = ''; return }
-    // 按综合分降序: 高分源置顶
     var sorted = state.sources.slice().sort(function (a, b) { return compositeScore(b) - compositeScore(a) })
     tbody.innerHTML = sorted.map(function (s) {
       var detail = Object.keys(s.sources || {}).map(function (k) {
@@ -199,7 +195,6 @@
         '<td>' + scoreHtml(s) + '</td>' +
         '<td>' + lastSuccessHtml(s.lastSuccess) + '</td><td><button data-src-del="' + esc(s.id) + '">删除</button></td></tr>'
     }).join('')
-
     renderPlatforms()
     if (state.sources.length) $('btn-search').disabled = false
   }
@@ -228,7 +223,6 @@
     })
   }
 
-  // ---------- 音源导入: 单 / 批量 / 压缩包 ----------
   function importByUrl() {
     var url = $('import-url').value.trim()
     if (!url) return
@@ -313,7 +307,6 @@
       .catch(function (e) { toast('删除失败: ' + e.message) })
   }
 
-  // ---------- 订阅分组 ----------
   function renderSubs() {
     api('/api/subscriptions').then(function (rs) {
       var list = rs || []
@@ -360,7 +353,6 @@
     if (!state.subEditor) state.subEditor = { urls: [] }
     state.subEditor.urls.push({ url: url, kind: kind })
     $('sub-url').value = ''
-    $('sub-editor').style.display = ''
     renderSubUrls()
   }
   function subDelUrl(i) {
@@ -375,23 +367,38 @@
     renderSubUrls()
   }
 
+  // 2 步式 addSub: 第一次点击仅打开 sub-editor, 二次点击才真创建
   function addSub() {
+    if (state.subEditor) {
+      var ed = state.subEditor
+      if (!ed.urls || !ed.urls.length) return toast('至少加入一个 URL', 'warn')
+      api('/api/subscriptions', { method: 'POST', body: { name: ed.name || $('sub-name').value.trim(), urls: ed.urls, intervalMin: ed.intervalMin || 60 } })
+        .then(function (r) {
+          state.subEditor = null
+          $('sub-editor').style.display = 'none'
+          $('sub-name').value = ''
+          $('sub-interval').value = 60
+          $('sub-url').value = ''
+          renderSubUrls()
+          renderSubs()
+          refreshSources()
+          if (r && r.initialFetchError) toast('已创建, 首次拉取失败: ' + r.initialFetchError, 'warn')
+          else toast('已创建订阅组, ' + (ed.urls.length) + ' 个 URL 已拉取', 'success')
+        })
+        .catch(function (e) { toast('创建失败: ' + e.message) })
+      return
+    }
     var name = $('sub-name').value.trim()
     if (!name) return toast('需要订阅组名称', 'warn')
-    var intervalMin = parseInt($('sub-interval').value) || 60
-    var urls = (state.subEditor && state.subEditor.urls) || []
-    if (!urls.length) return toast('至少加入一个 URL', 'warn')
-    api('/api/subscriptions', { method: 'POST', body: { name, urls, intervalMin } })
-      .then(function (r) {
-        $('sub-name').value = ''
-        $('sub-interval').value = 60
-        clearSubEditor()
-        renderSubs()
-        refreshSources()
-        if (r.initialFetchError) toast('已创建, 首次拉取失败: ' + r.initialFetchError, 'warn')
-        else toast('已创建订阅组, ' + urls.length + ' 个 URL 已拉取', 'success')
-      })
-      .catch(function (e) { toast('创建失败: ' + e.message) })
+    state.subEditor = {
+      name: name,
+      intervalMin: parseInt($('sub-interval').value) || 60,
+      urls: []
+    }
+    $('sub-editor').style.display = ''
+    $('sub-editor-title').textContent = '新建订阅组: ' + name + ' — 添加 URL 后再次点击"创建"'
+    renderSubUrls()
+    toast('请在下方添加 URL, 然后再次点击"创建"', 'success')
   }
 
   function refreshSub(gid) {
@@ -400,7 +407,8 @@
     renderSubs()
     api('/api/subscriptions/' + encodeURIComponent(gid) + '/refresh', { method: 'POST' })
       .then(function (r) {
-        var n = (r.added || []).length, e = (r.errors || []).length
+        var n = (r && r.added) ? r.added.length : 0
+        var e = (r && r.errors) ? r.errors.length : 0
         toast('已刷新: 导入 ' + n + ' / 错误 ' + e, e ? 'warn' : 'success')
         renderSubs(); refreshSources()
       })
@@ -414,7 +422,6 @@
       .catch(function (e) { toast('删除失败: ' + e.message) })
   }
 
-  // ---------- 搜索 ----------
   function renderSearchRows() {
     var tbody = $('search-tbody')
     if (!state.searchList.length) {
@@ -450,7 +457,6 @@
     return state.searchList.filter(function (s) { return s._sel })
   }
 
-  // ---------- 热搜 & 搜索建议 ----------
   var tipTimer = null
   function loadHot() {
     api('/api/hot?platform=' + encodeURIComponent(state.platform)).then(function (r) {
@@ -502,8 +508,7 @@
     song._vsize = {}
     renderSearchRows()
     var sources = state.sources.filter(function (s) { return s.sources && s.sources[state.platform] })
-    var remaining = sources.length
-    if (!remaining) { song._verifying = false; renderSearchRows(); return Promise.resolve() }
+    if (!sources.length) { song._verifying = false; renderSearchRows(); return Promise.resolve() }
     return fetch('/api/resolve-all/stream', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ platform: state.platform, song: pickSong(song), qualities: [] }),
@@ -520,9 +525,7 @@
           parts.forEach(function (p) {
             var m = /^data: (.*)$/m.exec(p)
             if (!m) return
-            try {
-              var d = JSON.parse(m[1])
-            } catch (e) { return }
+            try { var d = JSON.parse(m[1]) } catch (e) { return }
             if (d.done) { song._verifying = false; renderSearchRows(); return }
             mergeVerified(song, d.list || [])
             renderSearchRows()
@@ -577,7 +580,7 @@
         $('player-info').textContent = song.name + ' - ' + song.singer
         $('audio').src = state.now.url
       } else {
-        toast('解析失败: ' + (r.error || '无链接'))
+        toast('解析失败: ' + ((r && r.error) || '无链接'))
       }
     }).catch(function (e) { toast('解析失败: ' + e.message) })
   }
@@ -588,7 +591,7 @@
       if (r && r.url) {
         var url = '/api/download?url=' + encodeURIComponent(r.url) + '&name=' + encodeURIComponent(song.name + ' - ' + song.singer + '.flac')
         window.open(url, '_blank')
-      } else toast('解析失败: ' + (r.error || '无链接'))
+      } else toast('解析失败: ' + ((r && r.error) || '无链接'))
     }).catch(function (e) { toast('解析失败: ' + e.message) })
   }
 
@@ -623,7 +626,6 @@
     }).catch(function (e) { toast(e.message) })
   }
 
-  // ---------- 任务 ----------
   function renderTasks() {
     var wrap = $('task-list')
     toggleEmpty('task-empty', state.tasks)
@@ -639,7 +641,7 @@
 
   function loadTasks() {
     api('/api/tasks').then(function (r) {
-      state.tasks = r.list || []
+      state.tasks = (r && r.list) || []
       renderTasks()
     }).catch(function () {})
   }
@@ -662,13 +664,13 @@
     }
   }
 
-  // ---------- 曲库 ----------
   function renderLib() {
     var tbody = $('lib-tbody')
     toggleEmpty('lib-empty', state.library)
     var back = state.libPath ? '<button id="lib-up">⬆ 返回上级</button> ' : ''
     var current = state.libPath ? decodeURIComponent(state.libPath) : '/'
     $('lib-nav').innerHTML = back + '<span class="hint">' + esc(current) + '</span>'
+    toggleEmpty('lib-empty', state.library)
     if (!state.library.length) { tbody.innerHTML = ''; return }
     tbody.innerHTML = state.library.map(function (it, i) {
       var del = it.isDir ? '' : '<button data-act="del" data-i="' + i + '">删除</button>'
@@ -679,7 +681,6 @@
     }).join('')
   }
 
-  state.libPath = ''
   function loadLib(path) {
     if (typeof path === 'string') state.libPath = path
     api('/api/webdav/list?path=' + encodeURIComponent(state.libPath)).then(function (r) {
@@ -708,7 +709,6 @@
       .catch(function (e) { toast('删除失败: ' + e.message) })
   }
 
-  // ---------- 设置 ----------
   function loadSettings() {
     api('/api/config').then(function (c) {
       if (c && c.webdav) {
@@ -726,7 +726,6 @@
     }).then(function () { toast('已保存', 'success') }).catch(function (e) { toast('保存失败: ' + e.message) })
   }
 
-  // ---------- 事件绑定 ----------
   function bind() {
     ;['search', 'tasks', 'library', 'settings'].forEach(function (t) {
       $('tab-' + t).addEventListener('click', function () { switchTab(t) })
@@ -744,24 +743,24 @@
       if (k) { $('query').value = k; doSearch() }
     })
     $('check-all').addEventListener('change', function (e) {
-      state.searchList.forEach(function (s) { s._sel = e.target.checked })
+      var on = e.target.checked
+      state.searchList.forEach(function (s) { s._sel = on })
       renderSearchRows()
     })
     $('btn-batch').addEventListener('click', batchUpload)
-
     $('search-tbody').addEventListener('click', function (e) {
       var t = e.target
-      var act = t.getAttribute('data-act')
-      if (act === 'play') play(Number(t.getAttribute('data-i')))
-      if (act === 'dl') download(Number(t.getAttribute('data-i')))
-      if (act === 'up') uploadOne(Number(t.getAttribute('data-i')))
+      var i = t.getAttribute('data-i')
+      if (!i) return
+      if (t.getAttribute('data-act') === 'play') play(+i)
+      else if (t.getAttribute('data-act') === 'dl') download(+i)
+      else if (t.getAttribute('data-act') === 'up') uploadOne(+i)
     })
     $('search-tbody').addEventListener('change', function (e) {
-      if (e.target.classList.contains('row-check')) {
-        var i = Number(e.target.getAttribute('data-i'))
-        if (state.searchList[i]) state.searchList[i]._sel = e.target.checked
-        $('btn-batch').textContent = '批量上传所选(' + selected().length + ')'
-      }
+      if (!e.target.classList.contains('row-check')) return
+      var i = +e.target.getAttribute('data-i')
+      if (state.searchList[i]) state.searchList[i]._sel = e.target.checked
+      renderSearchRows()
     })
 
     $('btn-sse').addEventListener('click', startSSE)
@@ -774,12 +773,15 @@
     })
     $('lib-tbody').addEventListener('click', function (e) {
       var t = e.target
-      var act = t.getAttribute('data-act')
-      var i = Number(t.getAttribute('data-i'))
-      if (act === 'open' && state.library[i]) enterLib(state.library[i])
-      if (act === 'del') delItem(i)
+      if (!t) return
+      var i = t.getAttribute('data-i')
+      if (!i) return
+      if (t.getAttribute('data-act') === 'del') delItem(+i)
+      else if (t.getAttribute('data-act') === 'open') enterLib(state.library[+i])
     })
-    $('lib-nav').addEventListener('click', function (e) { if (e.target.id === 'lib-up') upLib() })
+    $('lib-nav').addEventListener('click', function (e) {
+      if (e.target.id === 'lib-up') upLib()
+    })
 
     $('btn-save-cfg').addEventListener('click', saveCfg)
     $('btn-import-url').addEventListener('click', importByUrl)
@@ -788,7 +790,6 @@
       var id = e.target.getAttribute('data-src-del')
       if (id) removeSource(id)
     })
-
     if ($('import-folder')) $('import-folder').addEventListener('change', importByFolder)
     if ($('import-multi')) $('import-multi').addEventListener('change', importByMulti)
     if ($('import-zip')) $('import-zip').addEventListener('change', importByZip)
@@ -816,146 +817,4 @@
   loadTasks()
   loadSettings()
   loadHot()
-})()
-
-
-function renderSubs() {
-  api('/api/subscriptions').then(function (rs) {
-    var list = rs || []
-    var tbody = $('sub-tbody')
-    toggleEmpty('sub-empty', list)
-    tbody.innerHTML = list.map(function (g) {
-      var busy = state.subBusy === g.id
-      var last = timeAgo(g.lastUpdate)
-      var errBadge = (g.lastErrorCount > 0)
-        ? '<span class="badge failed" title="上一轮 ' + g.lastErrorCount + ' 个错误">⚠ ' + g.lastErrorCount + ' 错</span> '
-        : (g.lastUpdate ? '<span class="badge success">✓</span> ' : '')
-      return '<tr>' +
-        '<td><strong>' + esc(g.name) + '</strong></td>' +
-        '<td>' + (g.urls || []).length + '</td>' +
-        '<td>每 ' + (g.intervalMin || 60) + ' 分</td>' +
-        '<td>' + errBadge + last + '</td>' +
-        '<td>' +
-          '<button data-sub-refresh="' + esc(g.id) + '"' + (busy ? ' disabled' : '') + '>' + (busy ? '刷新中…' : '立即刷新') + '</button> ' +
-          '<button data-sub-edit="' + esc(g.id) + '">编辑</button> ' +
-          '<button data-sub-del="' + esc(g.id) + '">删除</button>' +
-        '</td>' +
-      '</tr>'
-    }).join('')
-  }).catch(function () {})
-}
-
-function renderSubUrls() {
-  var box = $('sub-urls')
-  if (!box) return
-  var urls = (state.subEditor && state.subEditor.urls) || []
-  if (!urls.length) { box.innerHTML = '<span class="hint">尚未加入 URL</span>'; return }
-  box.innerHTML = urls.map(function (u, i) {
-    return '<div style="display:flex;gap:6px;align-items:center;padding:2px 0">' +
-      '<span class="badge ' + (u.kind === 'zip' ? 'running' : 'success') + '">' + esc(u.kind) + '</span>' +
-      '<code style="flex:1;word-break:break-all;font-size:12px">' + esc(u.url) + '</code>' +
-      '<button data-sub-url-del="' + i + '">×</button>' +
-    '</div>'
-  }).join('')
-}
-
-function subAddUrl() {
-  var url = $('sub-url').value.trim()
-  if (!url) return
-  var kind = $('sub-url-kind').value
-  if (!state.subEditor) state.subEditor = { urls: [] }
-  state.subEditor.urls.push({ url: url, kind: kind })
-  $('sub-url').value = ''
-  $('sub-editor').style.display = ''
-  $('sub-editor-title').textContent = '新建订阅组: 编辑 URL'
-  renderSubUrls()
-}
-
-function subDelUrl(i) {
-  if (!state.subEditor) return
-  state.subEditor.urls.splice(i, 1)
-  renderSubUrls()
-}
-
-function addSub() {
-  if (state.subEditor) {
-    var ed = state.subEditor
-    api('/api/subscriptions', { method: 'POST', body: { name: ed.name, urls: ed.urls, intervalMin: ed.intervalMin } })
-      .then(function () {
-        return api('/api/subscriptions/' + encodeURIComponent(ed.id), { method: 'DELETE' })
-      })
-      .then(function () { cancelSubEdit(); renderSubs(); refreshSources(); toast('已更新订阅组', 'success') })
-      .catch(function (e) { toast('保存失败: ' + e.message) })
-    return
-  }
-  var name = $('sub-name').value.trim()
-  if (!name) return toast('需要订阅组名称', 'warn')
-  var intervalMin = parseInt($('sub-interval').value) || 60
-  api('/api/subscriptions', { method: 'POST', body: { name, urls: [], intervalMin } })
-    .then(function () {
-      $('sub-name').value = ''
-      $('sub-interval').value = 60
-      renderSubs()
-      toast('已创建订阅组', 'success')
-    })
-    .catch(function (e) { toast('创建失败: ' + e.message) })
-}
-
-function refreshSub(gid) {
-  state.subBusy = gid
-  renderSubs()
-  api('/api/subscriptions/' + encodeURIComponent(gid) + '/refresh', { method: 'POST' })
-    .then(function () { renderSubs(); refreshSources() })
-    .catch(function (e) { toast('刷新失败: ' + e.message) })
-    .then(function () { state.subBusy = null; renderSubs() })
-}
-
-function removeSub(gid) {
-  if (!confirm('删除订阅组? (该组导入的音源也会被清理)')) return
-  api('/api/subscriptions/' + encodeURIComponent(gid), { method: 'DELETE' })
-    .then(function () { renderSubs(); refreshSources() })
-    .catch(function (e) { toast('删除失败: ' + e.message) })
-}
-
-function startSubEdit(g) {
-  state.subEditor = {
-    id: g.id,
-    name: g.name,
-    intervalMin: g.intervalMin || 60,
-    urls: (g.urls || []).map(function (u) {
-      if (typeof u === 'string') {
-        return { url: u, kind: u.toLowerCase().split('?')[0].endsWith('.zip') ? 'zip' : 'js' }
-      }
-      return u
-    })
-  }
-  $('sub-editor').style.display = ''
-  $('sub-editor-title').textContent = '编辑订阅组: ' + g.name
-  $('sub-name').value = g.name
-  $('sub-interval').value = g.intervalMin || 60
-  renderSubUrls()
-}
-
-function cancelSubEdit() {
-  state.subEditor = null
-  $('sub-editor').style.display = 'none'
-  $('sub-name').value = ''
-  $('sub-interval').value = 60
-  $('sub-url').value = ''
-}
-
-// patch: bind() 中 sub-tbody 的 click handler 没处理 data-sub-edit, 加上编辑入口
-(function () {
-  var tbody = $('sub-tbody')
-  if (tbody && !tbody._editPatched) {
-    tbody._editPatched = true
-    tbody.addEventListener('click', function (e) {
-      var eid = e.target.getAttribute('data-sub-edit')
-      if (!eid) return
-      api('/api/subscriptions').then(function (rs) {
-        var g = (rs || []).find(function (x) { return x.id === eid })
-        if (g) startSubEdit(g)
-      })
-    })
-  }
 })()
