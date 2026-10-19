@@ -817,3 +817,145 @@
   loadSettings()
   loadHot()
 })()
+
+
+function renderSubs() {
+  api('/api/subscriptions').then(function (rs) {
+    var list = rs || []
+    var tbody = $('sub-tbody')
+    toggleEmpty('sub-empty', list)
+    tbody.innerHTML = list.map(function (g) {
+      var busy = state.subBusy === g.id
+      var last = timeAgo(g.lastUpdate)
+      var errBadge = (g.lastErrorCount > 0)
+        ? '<span class="badge failed" title="上一轮 ' + g.lastErrorCount + ' 个错误">⚠ ' + g.lastErrorCount + ' 错</span> '
+        : (g.lastUpdate ? '<span class="badge success">✓</span> ' : '')
+      return '<tr>' +
+        '<td><strong>' + esc(g.name) + '</strong></td>' +
+        '<td>' + (g.urls || []).length + '</td>' +
+        '<td>每 ' + (g.intervalMin || 60) + ' 分</td>' +
+        '<td>' + errBadge + last + '</td>' +
+        '<td>' +
+          '<button data-sub-refresh="' + esc(g.id) + '"' + (busy ? ' disabled' : '') + '>' + (busy ? '刷新中…' : '立即刷新') + '</button> ' +
+          '<button data-sub-edit="' + esc(g.id) + '">编辑</button> ' +
+          '<button data-sub-del="' + esc(g.id) + '">删除</button>' +
+        '</td>' +
+      '</tr>'
+    }).join('')
+  }).catch(function () {})
+}
+
+function renderSubUrls() {
+  var box = $('sub-urls')
+  if (!box) return
+  var urls = (state.subEditor && state.subEditor.urls) || []
+  if (!urls.length) { box.innerHTML = '<span class="hint">尚未加入 URL</span>'; return }
+  box.innerHTML = urls.map(function (u, i) {
+    return '<div style="display:flex;gap:6px;align-items:center;padding:2px 0">' +
+      '<span class="badge ' + (u.kind === 'zip' ? 'running' : 'success') + '">' + esc(u.kind) + '</span>' +
+      '<code style="flex:1;word-break:break-all;font-size:12px">' + esc(u.url) + '</code>' +
+      '<button data-sub-url-del="' + i + '">×</button>' +
+    '</div>'
+  }).join('')
+}
+
+function subAddUrl() {
+  var url = $('sub-url').value.trim()
+  if (!url) return
+  var kind = $('sub-url-kind').value
+  if (!state.subEditor) state.subEditor = { urls: [] }
+  state.subEditor.urls.push({ url: url, kind: kind })
+  $('sub-url').value = ''
+  $('sub-editor').style.display = ''
+  $('sub-editor-title').textContent = '新建订阅组: 编辑 URL'
+  renderSubUrls()
+}
+
+function subDelUrl(i) {
+  if (!state.subEditor) return
+  state.subEditor.urls.splice(i, 1)
+  renderSubUrls()
+}
+
+function addSub() {
+  if (state.subEditor) {
+    var ed = state.subEditor
+    api('/api/subscriptions', { method: 'POST', body: { name: ed.name, urls: ed.urls, intervalMin: ed.intervalMin } })
+      .then(function () {
+        return api('/api/subscriptions/' + encodeURIComponent(ed.id), { method: 'DELETE' })
+      })
+      .then(function () { cancelSubEdit(); renderSubs(); refreshSources(); toast('已更新订阅组', 'success') })
+      .catch(function (e) { toast('保存失败: ' + e.message) })
+    return
+  }
+  var name = $('sub-name').value.trim()
+  if (!name) return toast('需要订阅组名称', 'warn')
+  var intervalMin = parseInt($('sub-interval').value) || 60
+  api('/api/subscriptions', { method: 'POST', body: { name, urls: [], intervalMin } })
+    .then(function () {
+      $('sub-name').value = ''
+      $('sub-interval').value = 60
+      renderSubs()
+      toast('已创建订阅组', 'success')
+    })
+    .catch(function (e) { toast('创建失败: ' + e.message) })
+}
+
+function refreshSub(gid) {
+  state.subBusy = gid
+  renderSubs()
+  api('/api/subscriptions/' + encodeURIComponent(gid) + '/refresh', { method: 'POST' })
+    .then(function () { renderSubs(); refreshSources() })
+    .catch(function (e) { toast('刷新失败: ' + e.message) })
+    .then(function () { state.subBusy = null; renderSubs() })
+}
+
+function removeSub(gid) {
+  if (!confirm('删除订阅组? (该组导入的音源也会被清理)')) return
+  api('/api/subscriptions/' + encodeURIComponent(gid), { method: 'DELETE' })
+    .then(function () { renderSubs(); refreshSources() })
+    .catch(function (e) { toast('删除失败: ' + e.message) })
+}
+
+function startSubEdit(g) {
+  state.subEditor = {
+    id: g.id,
+    name: g.name,
+    intervalMin: g.intervalMin || 60,
+    urls: (g.urls || []).map(function (u) {
+      if (typeof u === 'string') {
+        return { url: u, kind: u.toLowerCase().split('?')[0].endsWith('.zip') ? 'zip' : 'js' }
+      }
+      return u
+    })
+  }
+  $('sub-editor').style.display = ''
+  $('sub-editor-title').textContent = '编辑订阅组: ' + g.name
+  $('sub-name').value = g.name
+  $('sub-interval').value = g.intervalMin || 60
+  renderSubUrls()
+}
+
+function cancelSubEdit() {
+  state.subEditor = null
+  $('sub-editor').style.display = 'none'
+  $('sub-name').value = ''
+  $('sub-interval').value = 60
+  $('sub-url').value = ''
+}
+
+// patch: bind() 中 sub-tbody 的 click handler 没处理 data-sub-edit, 加上编辑入口
+(function () {
+  var tbody = $('sub-tbody')
+  if (tbody && !tbody._editPatched) {
+    tbody._editPatched = true
+    tbody.addEventListener('click', function (e) {
+      var eid = e.target.getAttribute('data-sub-edit')
+      if (!eid) return
+      api('/api/subscriptions').then(function (rs) {
+        var g = (rs || []).find(function (x) { return x.id === eid })
+        if (g) startSubEdit(g)
+      })
+    })
+  }
+})()
